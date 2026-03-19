@@ -457,42 +457,55 @@ async def get_adminlist_text(client: Client, chat_id: int, chat_title: str) -> s
     owner = []
     co_founders = []
     admins = []
-    ANONYMOUS_ID = 1087968824
     total_count = 0
 
     async for member in client.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS):
         user = member.user
+        
+        # Skip bots
         if user.is_bot:
             continue
 
-        is_anonymous = (user.id == ANONYMOUS_ID or user.first_name == "Group")
-        if is_anonymous:
+        # Extract privileges early
+        p = member.privileges
+
+        # ✅ Correct Pyrogram check for any anonymous admin
+        is_anonymous = p and p.is_anonymous
+
+        # Handle Hidden vs Visible profiles
+        if is_anonymous or user.is_deleted:
             mention = "Hidden"
+            title_str = ""  # Keeps the title completely hidden
         else:
             full_name = f"{user.first_name} {user.last_name or ''}".strip()
             mention = f"<a href='tg://user?id={user.id}'>{escape(full_name)}</a>"
+            title_str = f" {escape(member.custom_title)}" if member.custom_title else ""
 
         total_count += 1
-        title_str = "" if is_anonymous else (f" {member.custom_title}" if member.custom_title else "")
 
+        # Categorize Owner
         if member.status == enums.ChatMemberStatus.OWNER:
             owner.append(f"• {mention}{title_str}")
             continue
 
-        p = member.privileges
+        # Categorize Co-Founders vs Standard Admins
         if p and p.can_change_info and p.can_promote_members:
             co_founders.append(f"• {mention}{title_str}")
         else:
             admins.append(f"• {mention}{title_str}")
 
+    # Build the final string
     reply = f"<b>Admins in {escape(chat_title)}:</b>\n\n"
+    
     if owner:
         reply += "<b>👑 OWNER</b>\n" + "\n".join(owner) + "\n\n"
     if co_founders:
         reply += "<b>⚡ CO-FOUNDERS</b>\n" + "\n".join(co_founders) + "\n\n"
     if admins:
         reply += "<b>📋 ADMINS</b>\n" + "\n".join(admins) + "\n\n"
+        
     reply += f"<b>Total Admins:</b> {total_count}"
+    
     return reply
 
 # --- Welcome text formatting ---
@@ -648,10 +661,6 @@ def parse_duration(raw: str) -> int:
     return 0
 
 # --- Core command handlers ---
-async def owner_cmd(client: Client, message: Message) -> None:
-    owner_text = str(OWNER_ID) if OWNER_ID else "Not configured"
-    await message.reply_text(f"Owner ID: <code>{owner_text}</code>", parse_mode=enums.ParseMode.HTML)
-
 async def start(client: Client, message: Message) -> None:
     me = await client.get_me()
     args = get_args(message)
@@ -754,6 +763,46 @@ async def help_buttons(client: Client, callback_query: CallbackQuery) -> None:
         )
     else:
         await q.edit_message_text(body, parse_mode=enums.ParseMode.HTML, reply_markup=back_keyboard())
+
+async def owner_group(client: Client, message: Message):
+    chat = message.chat
+
+    if chat.type not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+        await message.reply_text("This command only works in groups.")
+        return
+
+    try:
+        owner = None
+        owner_member = None
+
+        async for member in client.get_chat_members(
+            chat.id, filter=enums.ChatMembersFilter.ADMINISTRATORS
+        ):
+            if member.status == enums.ChatMemberStatus.OWNER:
+                owner_member = member
+                owner = member.user
+                break
+
+        if not owner_member or not owner:
+            return await message.reply_text("Could not find group owner.")
+
+        # ✅ Correct check: Look inside member.privileges
+        is_anonymous = owner_member.privileges and owner_member.privileges.is_anonymous
+
+        if is_anonymous or owner.is_deleted:
+            owner_display = "Hidden"
+        else:
+            full_name = f"{owner.first_name} {owner.last_name or ''}".strip()
+            if owner.username:
+                owner_display = f"{full_name} (@{owner.username})"
+            else:
+                owner_display = full_name
+
+        text = f"👑 **Group Owner:** {owner_display}"
+        await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+
+    except Exception as e:
+        await message.reply_text(f"Error: {e}")
 
 async def generic_toggle(client: Client, message: Message, key: str, label: str) -> None:
     if not await require_admin(client, message):
@@ -5734,7 +5783,7 @@ def main():
     # Command handlers
     commands = {
         "start": start, "clone": clone, "help": help_cmd, "reload": reload_bot, "language": language,
-        "owner": owner_cmd, "antiraid": antiraid, "connection": connection, "disable": disable_cmd,
+        "owner": owner_group, "antiraid": antiraid, "connection": connection, "disable": disable_cmd,
         "enable": enable_cmd, "disabled": disabled_cmds, "setlogchannel": set_log_channel,
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
         "welcome": welcome_toggle, "setgoodbye": setgoodbye, "resetgoodbye": resetgoodbye,
