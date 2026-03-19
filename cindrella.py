@@ -76,6 +76,26 @@ def has_link(text: str) -> bool:
             return True
     return False
 
+import re
+
+EMOJI_PATTERN = re.compile(
+    r'[\U0001F600-\U0001F64F]|'   # Emoticons
+    r'[\U0001F300-\U0001F5FF]|'   # Symbols & pictographs
+    r'[\U0001F680-\U0001F6FF]|'   # Transport & map symbols
+    r'[\U0001F700-\U0001F77F]|'   # Alchemical symbols
+    r'[\U0001F780-\U0001F7FF]|'   # Geometric shapes
+    r'[\U0001F800-\U0001F8FF]|'   # Supplemental arrows
+    r'[\U0001F900-\U0001F9FF]|'   # Supplemental symbols and pictographs
+    r'[\U0001FA00-\U0001FA6F]|'   # Chess symbols
+    r'[\U0001FA70-\U0001FAFF]|'   # Symbols and pictographs extended
+    r'[\U00002702-\U000027B0]|'   # Dingbats
+    r'[\U000024C2-\U0001F251]|'   # Enclosed characters
+    r'[\u203C-\u3299]'             # Various other symbols
+)
+
+def has_emoji(text: str) -> bool:
+    return bool(EMOJI_PATTERN.search(text))
+
 # Bio cache to avoid hitting flood limits
 bio_cache = {}
 # --- Anonymous admin pending actions ---
@@ -83,13 +103,13 @@ pending_admin_actions = {}
 PENDING_ACTION_TIMEOUT = 300  # 5 minutes
 ANONYMOUS_ADMIN_ID = 1087968824
 # --- Global tracking structures ---
-pending_admin_actions = {}
+
 active_tagging = {}
 purge_running = {}
 FLOOD_WINDOW_SEC = 7
 FLOOD_LIMIT = 6
 flood_tracker: dict[tuple[int, int], deque] = defaultdict(deque)
-LOCK_TYPES = {"media", "sticker", "gif", "voice", "poll", "link"}
+LOCK_TYPES = {"media", "sticker", "gif", "voice", "poll", "link", "emoji", "text"}
 active_users: dict[int, deque[int]] = defaultdict(lambda: deque(maxlen=300))
 
 # --- Language support (English only now, but structure kept for future) ---
@@ -205,7 +225,7 @@ async def user_has_permission(client: Client, chat_id: int, user_id: int, perm: 
         return False
     except Exception:
         return False
-    
+
 async def require_bot_admin(client: Client, message: Message) -> bool:
     """
     Checks if bot is admin in the group. If not, sends a reply and returns False.
@@ -530,10 +550,16 @@ async def is_admin(client: Client, message: Message, uid: int | None = None) -> 
     except Exception:
         return False
 
-async def require_admin(client: Client, message: Message) -> bool:
-    if OWNER_ID and message.from_user and message.from_user.id == OWNER_ID:
+async def require_admin(client: Client, message: Message, user_id: int = None) -> bool:
+    if user_id is None:
+        if message.from_user:
+            user_id = message.from_user.id
+        else:
+            await message.reply_text("Could not identify user.")
+            return False
+    if OWNER_ID and user_id == OWNER_ID:
         return True
-    if not await is_admin(client, message):
+    if not await is_admin(client, message, user_id):
         await message.reply_text("Admin only command.")
         return False
     return True
@@ -740,21 +766,49 @@ async def generic_toggle(client: Client, message: Message, key: str, label: str)
     await set_chat_setting(message.chat.id, key, to_bool_str(enabled))
     await message.reply_text(f"{label} {'enabled' if enabled else 'disabled'}.")
 
-async def can_manage_filters(client: Client, message: Message) -> bool:
-    if message.from_user.id == OWNER_ID:
+async def can_manage_filters(client: Client, message: Message, admin_id: int = None) -> bool:
+    user_id = admin_id if admin_id is not None else (message.from_user.id if message.from_user else None)
+    if not user_id:
+        await message.reply_text("Could not identify admin.")
+        return False
+
+    if user_id == OWNER_ID:
         return True
-    if not await is_admin(client, message):
+
+    if not await is_admin(client, message, user_id):
         await message.reply_text("Admin only command.")
         return False
-    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+
+    member = await client.get_chat_member(message.chat.id, user_id)
     if member.privileges and member.privileges.can_change_info:
         return True
     await message.reply_text("You need 'Change Group Info' permission.")
     return False
 
-async def filter_cmd_handler(client: Client, message: Message):
+async def filter_cmd_handler(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "filter",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔐 Click To Prove Admin",
+                callback_data=f"prove_admin:{action_id}"
+            )
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
+        return
 
-    if not await can_manage_filters(client, message):
+    if not await can_manage_filters(client, message, admin_id=admin_id):
         return
 
     args = message.text.split(None, 2)
@@ -779,12 +833,32 @@ async def filter_cmd_handler(client: Client, message: Message):
         upsert=True
     )
     await message.reply_text(f"✅ Filter saved for: **{keyword}**")
-    
 
-async def stop_filter_handler(client: Client, message: Message):
-
-    if not await can_manage_filters(client, message):
+async def stop_filter_handler(client: Client, message: Message, verified=False, admin_id: int = None):
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "stopfilter",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔐 Click To Prove Admin",
+                callback_data=f"prove_admin:{action_id}"
+            )
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    if not await can_manage_filters(client, message, admin_id=admin_id):
+        return
+
     args = message.text.split(None, 1)
     if len(args) < 2:
         await message.reply_text("Usage: `/stop <keyword>`")
@@ -824,9 +898,10 @@ async def setwelcome(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
-        return
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
     # ... rest of the function
 
     data = {"type": "text", "text": "", "file_id": None, "caption": None}
@@ -885,9 +960,10 @@ async def resetwelcome(client: Client, message: Message, verified=False) -> None
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
-        return
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
     # ... rest of the function
     default_welcome = {"type": "text", "text": "Welcome {fullname}!", "file_id": None, "caption": None}
     await update_chat_settings(message.chat.id, welcome=default_welcome)
@@ -913,9 +989,10 @@ async def welcome_toggle(client: Client, message: Message, verified=False) -> No
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
-        return
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
     # ... rest of the function
 
     args = get_args(message)
@@ -945,9 +1022,10 @@ async def setgoodbye(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
-        return
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
     # ... rest of the function
 
     data = {"type": "text", "text": "", "file_id": None, "caption": None}
@@ -1006,9 +1084,10 @@ async def resetgoodbye(client: Client, message: Message, verified=False) -> None
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
-        return
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
     # ... rest of the function
     default_goodbye = {"type": "text", "text": "Goodbye {fullname}!", "file_id": None, "caption": None}
     await update_chat_settings(message.chat.id, goodbye=default_goodbye)
@@ -1034,9 +1113,10 @@ async def goodbye_toggle(client: Client, message: Message, verified=False) -> No
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
-        return
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
     # ... rest of the function
     
     args = get_args(message)
@@ -1111,9 +1191,33 @@ async def on_left_member(client: Client, event):
     else:
         await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message_id)
 
-async def setrules(client: Client, message: Message) -> None:
-    if not await require_admin(client, message):
+async def setrules(client: Client, message: Message, verified=False) -> None:
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "setrules",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔐 Click To Prove Admin",
+                callback_data=f"prove_admin:{action_id}"
+            )
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    # Admin check for normal users (only when not verified)
+    if not verified:
+        if not await require_admin(client, message):
+            return
 
     rules_text = None
 
@@ -1136,7 +1240,6 @@ async def setrules(client: Client, message: Message) -> None:
     await set_rules(message.chat.id, rules_text)
 
     await message.reply_text("✅ Rules have been set for this chat.")
-
     
 
 async def rules(client: Client, message: Message) -> None:
@@ -1188,47 +1291,6 @@ async def delnote(client: Client, message: Message) -> None:
     await notes_col.delete_one({"chat_id": message.chat.id, "name": name})
     await message.reply_text("Note deleted.")
 
-async def warn_common(client: Client, message: Message, delete_cmd: bool = False, silent: bool = False) -> None:
-    if not await require_admin(client, message):
-        return
-
-    target = await get_target_user(client, message)
-    if not target:
-        await message.reply_text("User not found.")
-        return
-    uid = target.id
-    chat_id = message.chat.id
-
-    # Reason extraction
-    args = get_args(message)
-    reason = None
-    if message.reply_to_message:
-        reason = " ".join(args) if args else None
-    else:
-        reason = " ".join(args[1:]) if len(args) > 1 else None
-
-    if await is_admin(client, message, uid):
-        await message.reply_text("I cannot warn an admin.")
-        return
-
-    if not await bot_has_permission(client, chat_id, "can_restrict_members"):
-        await message.reply_text("I need ban permission to warn users.")
-        return
-
-    # Create warning object
-    warning = {
-        "reason": reason,
-        "time": int(time.time()),
-        "admin_id": message.from_user.id
-    }
-
-    # Update database: push warning
-    await warns_col.update_one(
-        {"chat_id": chat_id, "user_id": uid},
-        {"$push": {"warnings": warning}},
-        upsert=True
-    )
-
 async def warn_common(client: Client, message: Message, delete_cmd: bool = False, silent: bool = False, delete_replied: bool = False, admin_id: int = None) -> None:
     target = await get_target_user(client, message)
     if not target:
@@ -1259,6 +1321,11 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
     admin = admin_id if admin_id else (message.from_user.id if message.from_user else None)
     if not admin:
         await message.reply_text("Could not identify admin.")
+        return
+
+    # 🔒 NEW: Admin restrict permission check
+    if not await user_has_permission(client, chat_id, admin, "can_restrict_members"):
+        await message.reply_text("❌ Aapke paas ban rights nahi hain (can_restrict_members permission required).")
         return
 
     # Create warning object
@@ -1343,14 +1410,20 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
         with suppress(Exception):
             await message.delete()
             
-async def resetallwarns(client: Client, message: Message, verified=False) -> None:
-
+async def resetallwarns(client: Client, message: Message, verified=False, admin_id=None):
     if not verified:
         if not await require_admin_proof(client, message, "resetallwarns"):
             return
 
-    if not await require_admin(client, message):
-        return
+    # 🔥 OWNER CHECK (IMPORTANT)
+    user_id = admin_id if admin_id else message.from_user.id
+
+    try:
+        member = await client.get_chat_member(message.chat.id, user_id)
+        if member.status != enums.ChatMemberStatus.OWNER:
+            return await message.reply_text("❌ Sirf group owner hi saare warnings reset kar sakta hai.")
+    except Exception:
+        return await message.reply_text("❌ Owner verify nahi ho saka.")
 
     chat_id = message.chat.id
     chat_title = message.chat.title or "this group"
@@ -1366,21 +1439,18 @@ async def resetallwarns(client: Client, message: Message, verified=False) -> Non
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
-async def warnsettings(client: Client, message: Message, verified=False):
-
+async def warnsettings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     if not verified:
         if not await require_admin_proof(client, message, "warnsettings"):
             return
-
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message, user_id=admin_id):
+            return
 
     chat_id = message.chat.id
     chat_title = message.chat.title or "this group"
 
-    # example settings display
     limit = await get_warn_limit(chat_id)
-    mode =  await get_warn_action(chat_id)
+    mode = await get_warn_action(chat_id)
 
     text = (
         f"⚙️ **Warning Settings for {chat_title}**\n\n"
@@ -1388,53 +1458,50 @@ async def warnsettings(client: Client, message: Message, verified=False):
         f"🔨 Action Mode: {mode}"
     )
 
-    await message.reply_text(
-        text,
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
+    await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
 
-async def warntime_cmd(client: Client, message: Message, verified=False):
-
+async def warntime_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     if not verified:
         if not await require_admin_proof(client, message, "warntime"):
             return
+        if not await require_admin(client, message, user_id=admin_id):
+            return
 
-    if not await require_admin(client, message):
-        return
+    # 🔥 Change info permission check
+    user_id = admin_id if admin_id else message.from_user.id
+    if not await user_has_permission(client, message.chat.id, user_id, "can_change_info"):
+        return await message.reply_text("❌ Aapke paas 'Change Group Info' permission nahi hai.")
 
     args = get_args(message)
 
     if not args:
         current = await get_chat_setting(message.chat.id, "warn_expiry", "0")
-
         if current == "0":
             text = "No expiry (warnings last forever)"
         else:
             text = f"{current} seconds"
-
-        return await message.reply_text(
-            f"Current warning expiry: {text}"
-        )
+        return await message.reply_text(f"Current warning expiry: {text}")
 
     duration_str = args[0]
-
     if duration_str.lower() in ("0", "off"):
         seconds = 0
     else:
         seconds = parse_duration(duration_str)
 
     await set_chat_setting(message.chat.id, "warn_expiry", str(seconds))
-
     await message.reply_text("✅ Warning expiry updated.")
 
-async def warnmode_cmd(client: Client, message: Message, verified=False):
-
+async def warnmode_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     if not verified:
         if not await require_admin_proof(client, message, "warnmode"):
             return
+        if not await require_admin(client, message, user_id=admin_id):
+            return
 
-    if not await require_admin(client, message):
-        return
+    # 🔥 Change info permission check
+    user_id = admin_id if admin_id else message.from_user.id
+    if not await user_has_permission(client, message.chat.id, user_id, "can_change_info"):
+        return await message.reply_text("❌ Aapke paas 'Change Group Info' permission nahi hai.")
 
     chat_id = message.chat.id
     current_action = await get_warn_action(chat_id)
@@ -1452,22 +1519,40 @@ async def warnmode_cmd(client: Client, message: Message, verified=False):
             buttons.append(row)
             row = []
 
-    # Add button to change warn limit
     buttons.append([InlineKeyboardButton(f"🔢 Change Warn Limit ({current_limit})", callback_data="warnlimit:menu")])
     buttons.append([InlineKeyboardButton("🗑 Close", callback_data="del_msg")])
 
     keyboard = InlineKeyboardMarkup(buttons)
- 
-    await message.reply_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
+    await message.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
 
-async def warninfo_cmd(client: Client, message: Message) -> None:
-    # Admin only
-    if not await require_admin(client, message):
+async def warninfo_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "warninfo",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    # Admin check for normal users (only when not verified)
+    if not verified:
+        user_id = admin_id if admin_id else (message.from_user.id if message.from_user else None)
+        if not user_id:
+            await message.reply_text("Could not identify admin.")
+            return
+        if not await require_admin(client, message, user_id=user_id):
+            return
 
     target = await get_target_user(client, message)
     if not target:
@@ -1476,7 +1561,7 @@ async def warninfo_cmd(client: Client, message: Message) -> None:
 
     chat_id = message.chat.id
     uid = target.id
-    issuer_id = message.from_user.id
+    issuer_id = admin_id if admin_id else message.from_user.id
 
     # Check if target is an admin
     if await is_admin(client, message, uid) and issuer_id != OWNER_ID:
@@ -1531,7 +1616,7 @@ async def warninfo_cmd(client: Client, message: Message) -> None:
         f"• Warnings: {warn_count}/{limit}\n"
         f"• Status: {status_text}"
     )
-    await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+    await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)        
 
 pending_warn_actions = {}
 
@@ -1686,14 +1771,39 @@ async def swarn(client: Client, message: Message) -> None:
 
     await warn_common(client, message, delete_cmd=True, silent=True, delete_replied=False)
 
-async def warnings(client: Client, message: Message) -> None:
+async def warnings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "warnings",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
+        return
+
+    # Admin check for normal users
+    if not verified:
+        user_id = admin_id if admin_id else (message.from_user.id if message.from_user else None)
+        if not user_id:
+            await message.reply_text("Could not identify admin.")
+            return
+        if not await require_admin(client, message, user_id=user_id):
+            return
+
     target = await get_target_user(client, message)
     if not target:
         return await message.reply_text("User not found.")
 
-    
-    """Show all warnings for a user (no clickable links)."""
-    target = await get_target_user(client, message) or message.from_user
     uid = target.id
     chat_id = message.chat.id
 
@@ -1708,7 +1818,6 @@ async def warnings(client: Client, message: Message) -> None:
     limit = await get_warn_limit(chat_id)
     action = await get_warn_action(chat_id)
 
-    # Plain‑text user representation
     name_parts = [target.first_name]
     if target.last_name:
         name_parts.append(target.last_name)
@@ -1726,23 +1835,18 @@ async def warnings(client: Client, message: Message) -> None:
         text += "**List of warnings:**\n"
         for i, w in enumerate(warnings_list, 1):
             reason = w.get("reason", "No reason")
-            # Optionally include time: you can add a line with timestamp if desired
-            # time_str = datetime.fromtimestamp(w['time']).strftime('%Y-%m-%d %H:%M') if 'time' in w else ''
-            # text += f"{i}. {reason} ({time_str})\n"
             text += f"{i}. {reason}\n"
     else:
         text += "No warnings recorded."
 
     await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
 
-async def unwarn(client: Client, message: Message, verified=False):
-
+async def unwarn(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     if not verified:
         if not await require_admin_proof(client, message, "unwarns"):
             return
-
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     target = await get_target_user(client, message)
     if not target:
@@ -1764,15 +1868,17 @@ async def unwarn(client: Client, message: Message, verified=False):
 
     await message.reply_text(f"✅ Latest warning removed from {target.mention}.")
 
-async def resetwarns(client: Client, message: Message, verified=False):
-
+async def resetwarns(client: Client, message: Message, verified=False, admin_id: int = None):
     if not verified:
         if not await require_admin_proof(client, message, "resetwarns"):
             return
+        if not await require_admin(client, message):
+            return
 
-    if not await require_admin(client, message):
-        return
-
+    # 🔥 Ban permission check
+    user_id = admin_id if admin_id else message.from_user.id
+    if not await user_has_permission(client, message.chat.id, user_id, "can_restrict_members"):
+        return await message.reply_text("❌ Aapke paas ban rights nahi hain (can_restrict_members permission required).")
     target = await get_target_user(client, message)
     if not target:
         await message.reply_text("User not found.")
@@ -1781,20 +1887,13 @@ async def resetwarns(client: Client, message: Message, verified=False):
     chat_id = message.chat.id
     uid = target.id
 
-    # 🔎 Check if user has warnings
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": uid})
-
     if not doc or not doc.get("warnings"):
         await message.reply_text("⚠️ This user has no warnings.")
         return
 
-    # 🗑 Delete warnings
-    await warns_col.delete_one({
-        "chat_id": chat_id,
-        "user_id": uid
-    })
-
-    await message.reply_text(f"✅ All warnings reset for {target.mention}.")    
+    await warns_col.delete_one({"chat_id": chat_id, "user_id": uid})
+    await message.reply_text(f"✅ All warnings reset for {target.mention}.")            
 
 async def do_restrict(client: Client, message: Message, mode: str) -> None:
     if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
@@ -1851,8 +1950,8 @@ async def mute(client: Client, message: Message, verified=False):
         if not await require_admin_proof(client, message, "mute"):
             return
 
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     # check bot admin
     if not await bot_is_admin(client, message.chat.id):
@@ -1887,13 +1986,11 @@ async def mute(client: Client, message: Message, verified=False):
     await message.reply_text(f"🔇 {target.mention} muted.")
 
 async def dmute(client: Client, message: Message, verified=False):
-
     if not verified:
         if not await require_admin_proof(client, message, "dmute"):
             return
-
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     # check bot admin
     if not await bot_is_admin(client, message.chat.id):
@@ -1916,32 +2013,30 @@ async def dmute(client: Client, message: Message, verified=False):
 
     # CHECK ALREADY MUTED
     if member.permissions and not member.permissions.can_send_messages:
-        # Agar pehle se muted hai, toh sirf reply bhejenge (return nahi karenge)
         await message.reply_text("⚠️ User is already muted.")
     else:
-        # Agar muted nahi hai, toh mute karenge
         await client.restrict_chat_member(
             message.chat.id,
             uid,
             ChatPermissions(can_send_messages=False)
         )
+        # Send a temporary confirmation message
+        conf_msg = await message.reply_text(f"🔇 {target.mention} muted.")
+        # Delete confirmation after 3 seconds
+        asyncio.create_task(delete_after_delay(conf_msg, 3))
 
-    # AB DELETE LOGIC (Dono cases mein kaam karega)
-    
-    # 1. Jis message pe reply kiya gaya hai (Spam message)
+    # Delete the replied message (spam)
     if message.reply_to_message:
         try:
             await message.reply_to_message.delete()
         except Exception:
             pass
 
-    # 2. Aapka /dmute wala command message
+    # Delete the command message
     try:
         await message.delete()
     except Exception:
         pass
-
-    await message.delete()
 
 async def smute(client: Client, message: Message, verified=False):
 
@@ -1949,8 +2044,8 @@ async def smute(client: Client, message: Message, verified=False):
         if not await require_admin_proof(client, message, "smute"):
             return
 
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     # check bot admin
     if not await bot_is_admin(client, message.chat.id):
@@ -1987,8 +2082,8 @@ async def tmute(client: Client, message: Message, verified=False):
         if not await require_admin_proof(client, message, "tmute"):
             return
 
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     # check bot admin
     if not await bot_is_admin(client, message.chat.id):
@@ -2046,8 +2141,8 @@ async def unmute(client: Client, message: Message, verified=False) -> None:
         return
 
     # 👮 Admin check
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     target = await get_target_user(client, message)
     if not target:
@@ -2102,8 +2197,8 @@ async def ban(client: Client, message: Message, verified=False):
         if not await require_admin_proof(client, message, "ban"):
             return
     
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     if not await check_ban_permissions(client, message):
         return
@@ -2131,14 +2226,18 @@ async def dban(client: Client, message: Message, verified=False):
     
     # Anonymous admin proof
     if not verified:
-        if not await require_admin_proof(client, message, "dban"):  # 👈 use "dban", not "ban"
+        if not await require_admin_proof(client, message, "dban"):
+            return
+        if not await require_admin(client, message):
             return
 
-    if not await require_admin(client, message):
-        return
+    # Check bot has restrict permission (required for ban)
+    if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
+        return await message.reply_text("❌ I need ban permission.")
 
-    if not await check_ban_permissions(client, message):
-        return
+    # Check bot has delete permission (for deleting the replied message)
+    if not await bot_has_permission(client, message.chat.id, "can_delete_messages"):
+        return await message.reply_text("❌ I need delete permission to remove the message.")
 
     user = await get_target_user(client, message)
     if not user:
@@ -2148,25 +2247,22 @@ async def dban(client: Client, message: Message, verified=False):
     chat_id = message.chat.id
     user_id = user.id
 
-    # Always delete the replied message first
+    # Delete the replied message first
     if message.reply_to_message:
         try:
             await message.reply_to_message.delete()
         except Exception as e:
             await message.reply_text(f"Could not delete replied message: {e}")
 
-    # Check target status
     status = await check_target_status(client, chat_id, user_id, "dban")
 
     if status == "admin":
         await message.reply_text("❌ I can't ban an admin.")
         return
-
     if status == "already_banned":
         await message.reply_text("⚠️ User is already banned.")
         return
 
-    # Status is "ok" → proceed to ban
     try:
         await client.ban_chat_member(chat_id, user_id)
         await message.reply_text(f"✅ {user.mention} banned.")
@@ -2181,9 +2277,8 @@ async def sban(client: Client, message: Message, verified=False):
     if not verified:
         if not await require_admin_proof(client, message, "sban"):   # 👈 yahan "sban"
             return
-
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     if not await check_ban_permissions(client, message):
         return
@@ -2194,7 +2289,6 @@ async def sban(client: Client, message: Message, verified=False):
         return
 
     status = await check_target_status(client, message.chat.id, user.id, "sban")
-
     if status != "ok":
         return   # silently ignore (already banned or admin)
 
@@ -2209,8 +2303,8 @@ async def unban(client: Client, message: Message, verified=False):
     if not verified:
         if not await require_admin_proof(client, message, "unban"):
             return
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
     if not await check_ban_permissions(client, message):
         return  
     user = await get_target_user(client, message)
@@ -2236,8 +2330,8 @@ async def kick(client: Client, message: Message, verified=False):
         if not await require_admin_proof(client, message, "kick"):
             return
 
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     if not await check_ban_permissions(client, message):
         return
@@ -2266,8 +2360,8 @@ async def skick(client: Client, message: Message, verified=False):
         if not await require_admin_proof(client, message, "skick"):
             return
 
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     if not await check_ban_permissions(client, message):
         return
@@ -2280,17 +2374,16 @@ async def skick(client: Client, message: Message, verified=False):
     await client.ban_chat_member(message.chat.id, user.id)
     await client.unban_chat_member(message.chat.id, user.id)
 
-async def dkick(client: Client, message: Message, verified=False):
+async def dkick(client: Client, message: Message, verified=False) -> None:
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
     
-    # anonymous admin proof
+    # Anonymous admin proof
     if not verified:
         if not await require_admin_proof(client, message, "dkick"):
             return
-
-    if not await require_admin(client, message):
-        return
+        if not await require_admin(client, message):
+            return
 
     if not await check_ban_permissions(client, message):
         return
@@ -2300,10 +2393,29 @@ async def dkick(client: Client, message: Message, verified=False):
         await message.reply_text("User not found.")
         return
 
-    await client.ban_chat_member(message.chat.id, user.id)
-    await client.unban_chat_member(message.chat.id, user.id)
+    chat_id = message.chat.id
+    user_id = user.id
 
-    await message.delete()
+    # 🔥 Delete the replied message first (the spam message)
+    if message.reply_to_message:
+        try:
+            await message.reply_to_message.delete()
+        except Exception as e:
+            await message.reply_text(f"Could not delete replied message: {e}")
+
+    # Perform kick (ban + unban)
+    try:
+        await client.ban_chat_member(chat_id, user_id)
+        await client.unban_chat_member(chat_id, user_id)
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to kick: {e}")
+        return
+
+    # Delete the command message
+    try:
+        await message.delete()
+    except Exception:
+        pass  # Ignore if command message can't be deleted
 
 async def tban(client: Client, message: Message):
 
@@ -2338,7 +2450,7 @@ async def kickme(client: Client, message: Message) -> None:
     await client.unban_chat_member(message.chat.id, uid)
     await message.reply_text("You have left the group.")
 
-async def lock(client: Client, message: Message, verified=False) -> None:
+async def lock(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         action_id = str(uuid.uuid4())
@@ -2361,11 +2473,12 @@ async def lock(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # Check user is admin
-    if not await require_admin(client, message):
-        return
+    # Admin check – only for non‑verified
+    if not verified:
+        if not await require_admin(client, message):
+            return
 
-    # Additional permission: need 'can_change_info' for normal users
+    # Permission check for normal users (if from_user exists)
     if message.from_user:
         if not await user_has_permission(
             client,
@@ -2378,7 +2491,7 @@ async def lock(client: Client, message: Message, verified=False) -> None:
             )
             return
 
-    # Bot permission check: must be able to delete messages (for lock enforcement)
+    # Bot permission check
     if not await bot_has_permission(client, message.chat.id, "can_delete_messages"):
         await message.reply_text(
             "❌ I don't have the right to delete messages. "
@@ -2387,13 +2500,27 @@ async def lock(client: Client, message: Message, verified=False) -> None:
         return
 
     args = get_args(message)
-    if not args or args[0].lower() not in LOCK_TYPES:
+    if not args:
         await message.reply_text(
             "Usage: /lock media|sticker|gif|voice|poll|link|emoji|text|all"
         )
         return
 
     lock_type = args[0].lower()
+
+    # Handle "all" by delegating to lockall
+    if lock_type == "all":
+        # Determine admin ID: use passed admin_id, or fallback to message.from_user.id
+        admin_id_to_use = admin_id if admin_id is not None else (message.from_user.id if message.from_user else None)
+        await lockall(client, message, verified=verified, admin_id=admin_id_to_use)
+        return
+
+    if lock_type not in LOCK_TYPES:
+        await message.reply_text(
+            "Usage: /lock media|sticker|gif|voice|poll|link|emoji|text|all"
+        )
+        return
+
     current = await get_chat_setting(message.chat.id, f"lock_{lock_type}", "0")
     if current == "1":
         await message.reply_text(f"ℹ️ `{lock_type}` is already locked.")
@@ -2402,8 +2529,7 @@ async def lock(client: Client, message: Message, verified=False) -> None:
     await set_chat_setting(message.chat.id, f"lock_{lock_type}", "1")
     await message.reply_text(f"🔒 `{lock_type}` locked.")
 
-
-async def unlock(client: Client, message: Message, verified=False) -> None:
+async def unlock(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         action_id = str(uuid.uuid4())
@@ -2426,9 +2552,12 @@ async def unlock(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    if not await require_admin(client, message):
-        return
+    # Admin check
+    if not verified:
+        if not await require_admin(client, message):
+            return
 
+    # Permission check for normal users
     if message.from_user:
         if not await user_has_permission(
             client,
@@ -2441,6 +2570,7 @@ async def unlock(client: Client, message: Message, verified=False) -> None:
             )
             return
 
+    # Bot permission check
     if not await bot_has_permission(client, message.chat.id, "can_delete_messages"):
         await message.reply_text(
             "❌ I don't have the right to delete messages. "
@@ -2449,79 +2579,97 @@ async def unlock(client: Client, message: Message, verified=False) -> None:
         return
 
     args = get_args(message)
-    if not args or args[0].lower() not in LOCK_TYPES:
+    if not args:
         await message.reply_text(
             "Usage: /unlock media|sticker|gif|voice|poll|link|emoji|text|all"
         )
         return
 
     lock_type = args[0].lower()
+
+    # Handle "all" by delegating to unlockall (FIXED: was lockall)
+    if lock_type == "all":
+        admin_id_to_use = admin_id if admin_id is not None else (message.from_user.id if message.from_user else None)
+        await unlockall(client, message, verified=verified, admin_id=admin_id_to_use)
+        return
+
+    if lock_type not in LOCK_TYPES:
+        await message.reply_text(
+            "Usage: /unlock media|sticker|gif|voice|poll|link|emoji|text|all"
+        )
+        return
+
     current = await get_chat_setting(message.chat.id, f"lock_{lock_type}", "0")
     if current == "0":
         await message.reply_text(f"ℹ️ `{lock_type}` is already unlocked.")
         return
 
     await set_chat_setting(message.chat.id, f"lock_{lock_type}", "0")
-    await message.reply_text(f"🔓 `{lock_type}` unlocked.")
+    await message.reply_text(f"🔓 `{lock_type}` unlocked.")    
 
+async def lockall(client: Client, message: Message, verified=False, admin_id=None):
 
-async def unlockall(client: Client, message: Message, verified=False) -> None:
-    # Anonymous admin detection
-    if not verified and message.from_user is None and message.sender_chat:
-        action_id = str(uuid.uuid4())
-        pending_admin_actions[action_id] = {
-            "chat_id": message.chat.id,
-            "message": message,
-            "action": "unlockall",
-            "time": time.time(),
-            "used": False
-        }
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "🔐 Click To Prove Admin",
-                callback_data=f"prove_admin:{action_id}"
-            )
-        ]])
-        await message.reply_text(
-            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
-            reply_markup=keyboard
-        )
-        return
-
-    if not await require_admin(client, message):
-        return
-
-    if message.from_user:
-        if not await user_has_permission(
-            client,
-            message.chat.id,
-            message.from_user.id,
-            "can_change_info"
-        ):
-            await message.reply_text(
-                "❌ You need 'Change Group Info' permission to manage locks."
-            )
+    # 🔐 Anonymous admin proof
+    if not verified:
+        if not await require_admin_proof(client, message, "lockall"):
             return
 
-    if not await bot_has_permission(client, message.chat.id, "can_delete_messages"):
-        await message.reply_text(
-            "❌ I don't have the right to delete messages. "
-            "Please give me admin with delete permission to use locks."
-        )
+    # 👮 Admin check
+    if not verified:
+        if not await require_admin(client, message):
+            return
+
+    # 🤖 Bot permission check
+    if not await check_ban_permissions(client, message):
         return
 
-    # Unlock all lock types
-    unlocked_count = 0
-    for lock_type in LOCK_TYPES:
-        current = await get_chat_setting(message.chat.id, f"lock_{lock_type}", "0")
-        if current == "1":
-            await set_chat_setting(message.chat.id, f"lock_{lock_type}", "0")
-            unlocked_count += 1
+    try:
+        await client.set_chat_permissions(
+            message.chat.id,
+            ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_send_polls=False
+            )
+        )
+        await message.reply_text("🔒 Group Locked Successfully!")
 
-    if unlocked_count == 0:
-        await message.reply_text("ℹ️ No locks were enabled.")
-    else:
-        await message.reply_text(f"🔓 Unlocked {unlocked_count} lock(s).")
+    except Exception as e:
+        await message.reply_text(f"Error: {e}")
+
+async def unlockall(client: Client, message: Message, verified=False, admin_id=None):
+
+    # 🔐 Anonymous admin proof
+    if not verified:
+        if not await require_admin_proof(client, message, "unlockall"):
+            return
+
+    # 👮 Admin check
+    if not verified:
+        if not await require_admin(client, message):
+            return
+
+    # 🤖 Bot permission check
+    if not await check_ban_permissions(client, message):
+        return
+
+    try:
+        await client.set_chat_permissions(
+            message.chat.id,
+            ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_send_polls=True
+            )
+        )
+        await message.reply_text("🔓 Group Unlocked Successfully!")
+
+    except Exception as e:
+        await message.reply_text(f"Error: {e}")
 
 async def cleanservice(client: Client, message: Message) -> None:
     await generic_toggle(client, message, "clean_service", "cleanservice")
@@ -2563,9 +2711,10 @@ async def approve(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # User admin check
-    if not await require_admin(client, message):
-        return
+    # ✅ Admin check - only for non-verified (normal) admins
+    if not verified:
+        if not await require_admin(client, message):
+            return
 
     # Additional permission check for normal users
     if message.from_user:
@@ -2639,8 +2788,10 @@ async def unapprove(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    if not await require_admin(client, message):
-        return
+    # ✅ Admin check - only for non-verified (normal) admins
+    if not verified:
+        if not await require_admin(client, message):
+            return
 
     # Permission check for normal users
     if message.from_user:
@@ -2679,14 +2830,50 @@ async def unapprove(client: Client, message: Message, verified=False) -> None:
     await message.reply_text(f"❌ {target.mention} unapproved.")
 
 
-async def unapproveall(client: Client, message: Message, verified=False) -> None:
+async def unapproveall(client: Client, message: Message, verified=False, admin_id=None) -> None:
+
+    if not verified:
+        if not await require_admin_proof(client, message, "unapproveall"):
+            return
+
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin here.")
+
+    if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
+        return await message.reply_text("❌ I don't have ban permission.")
+
+    # OWNER CHECK
+    user_id = admin_id if admin_id else message.from_user.id
+
+    try:
+        member = await client.get_chat_member(message.chat.id, user_id)
+        if member.status != enums.ChatMemberStatus.OWNER:
+            return await message.reply_text("❌ Sirf group owner hi ye command use kar sakta hai.")
+    except Exception:
+        return await message.reply_text("❌ Owner verify nahi ho saka.")
+
+    # ✅ BUTTON (IMPORTANT)
+    chat_id = message.chat.id
+    chat_title = message.chat.title or "this group"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚠️ Unapprove All", callback_data=f"unapproveall:confirm:{chat_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"unapproveall:cancel:{chat_id}")]
+    ])
+
+    await message.reply_text(
+        f"⚠️ **Are you sure?**\n\nThis will remove all approved users from {chat_title}.",
+        reply_markup=keyboard
+    )
+
+async def approved(client: Client, message: Message, verified=False) -> None:
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         action_id = str(uuid.uuid4())
         pending_admin_actions[action_id] = {
             "chat_id": message.chat.id,
             "message": message,
-            "action": "unapproveall",
+            "action": "approved",          # ✅ sahi action naam
             "time": time.time(),
             "used": False
         }
@@ -2705,45 +2892,13 @@ async def unapproveall(client: Client, message: Message, verified=False) -> None
     # Bot admin check
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin here.")
-
-    # Bot permission check (optional, but consistent with approve/unapprove)
-    if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
-        return await message.reply_text("❌ I don't have ban permission.")
-
-    # User admin check
-    if not await require_admin(client, message):
-        return
-
-    # Additional permission check for normal users
-    if message.from_user:
-        if not await user_has_permission(
-            client,
-            message.chat.id,
-            message.from_user.id,
-            "can_change_info"
-        ):
-            await message.reply_text(
-                "❌ You need 'Change Group Info' permission to unapprove all users."
-            )
+    
+    # ✅ Admin check - normal admin ke liye
+    if not verified:
+        if not await require_admin(client, message):
             return
 
-    # Delete all approved entries for this chat
-    result = await approved_col.delete_many({"chat_id": message.chat.id})
-    count = result.deleted_count
-
-    if count == 0:
-        await message.reply_text("ℹ️ No approved users to remove.")
-    else:
-        await message.reply_text(f"✅ Removed {count} approved user(s) from this chat.")
-
-async def approved(client: Client, message: Message) -> None:
-    # Bot admin check
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin here.")
-    
-    if not await require_admin(client, message):
-        return
-
+    # Approved users ki list dikhao
     cursor = approved_col.find({"chat_id": message.chat.id})
     users = await cursor.to_list(length=1000)
     if users:
@@ -2809,7 +2964,7 @@ async def adminlist(client: Client, message: Message) -> None:
         parse_mode=enums.ParseMode.HTML
     )
 
-async def promote(client: Client, message: Message, verified=False) -> None:
+async def promote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
     
@@ -2831,12 +2986,18 @@ async def promote(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
+    # Admin check - only for non-verified
+    if not verified:
+        if not await require_admin(client, message):
+            return
+
+    # Determine the user ID for permission checks
+    user_id = admin_id if admin_id else message.from_user.id
+    if not user_id:
+        await message.reply_text("Could not identify admin.")
         return
 
-    # ✅ USER PERMISSION CHECK: Kya user ke paas add admin ka permission hai?
-    user_id = message.from_user.id
+    # Check if user has permission to promote
     if not await user_has_permission(client, message.chat.id, user_id, "can_promote_members"):
         await message.reply_text("❌ You don't have permission to add admins.")
         return
@@ -2856,7 +3017,7 @@ async def promote(client: Client, message: Message, verified=False) -> None:
     try:
         await client.promote_chat_member(
             message.chat.id, target.id,
-            privileges=ChatPrivileges(      # <-- Correct: from types, not enums
+            privileges=ChatPrivileges(
                 can_manage_chat=True,
                 can_delete_messages=False,
                 can_restrict_members=False,
@@ -2873,7 +3034,7 @@ async def promote(client: Client, message: Message, verified=False) -> None:
     except Exception as e:
         await message.reply_text(f"Failed to promote: {e}")
 
-async def demote(client: Client, message: Message, verified=False) -> None:
+async def demote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
     
@@ -2895,14 +3056,20 @@ async def demote(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # original code follows (including require_admin check if needed)
-    if not await require_admin(client, message):
+    # Admin check - only for non-verified
+    if not verified:
+        if not await require_admin(client, message):
+            return
+
+    # Determine the user ID for permission checks
+    user_id = admin_id if admin_id else message.from_user.id
+    if not user_id:
+        await message.reply_text("Could not identify admin.")
         return
 
-    # ✅ USER PERMISSION CHECK: Kya user ke paas add admin ka permission hai?
-    user_id = message.from_user.id
+    # Check if user has permission to demote (needs can_promote_members)
     if not await user_has_permission(client, message.chat.id, user_id, "can_promote_members"):
-        await message.reply_text("❌ You don't have permission to add admins.")
+        await message.reply_text("❌ You don't have permission to remove admins.")
         return
 
     # Check if bot has permission to demote
@@ -2918,7 +3085,7 @@ async def demote(client: Client, message: Message, verified=False) -> None:
     try:
         await client.promote_chat_member(
             message.chat.id, target.id,
-            privileges=ChatPrivileges(      # <-- Correct
+            privileges=ChatPrivileges(
                 can_manage_chat=False,
                 can_delete_messages=False,
                 can_restrict_members=False,
@@ -3180,7 +3347,7 @@ async def report(client: Client, message: Message) -> None:
         await message.reply_text("Reply to a message to report it.")
         return
     offender = message.reply_to_message.from_user
-    await message.reply_text(f"🚨 Reported: {offender.mention}")
+    await message.reply_text(f"🚨 Reported {offender.mention}")
 
 ADMIN_TAG_COOLDOWN = {}
 ADMIN_COOLDOWN_TIME = 30
@@ -3330,7 +3497,7 @@ async def purgebots(client: Client, message: Message):
                 await msg.delete()
                 deleted += 1
         except:
-            pass
+            pass 
     await message.reply_text(f"Deleted {deleted} bot messages.")
 
 async def purgemedia(client: Client, message: Message):
@@ -3432,9 +3599,10 @@ async def del_message(client: Client, message: Message, verified=False) -> None:
         )
         return
 
-    # User must be admin
-    if not await require_admin(client, message):
-        return
+    # ✅ Admin check - only for non-verified (normal) admins
+    if not verified:
+        if not await require_admin(client, message):
+            return
 
     # For normal admins, check delete permission
     if message.from_user:
@@ -3471,67 +3639,145 @@ async def del_message(client: Client, message: Message, verified=False) -> None:
     except Exception as e:
         await message.reply_text(f"Failed to delete: {e}")
 
-async def pin_message(client: Client, message: Message) -> None:
+async def pin_message(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "pin",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
+        return
+
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
 
-    # check bot admin
-    if not await require_admin(client, message):
+    # Determine user ID
+    user_id = admin_id if admin_id else message.from_user.id
+    if not user_id:
+        await message.reply_text("Could not identify admin.")
         return
-    
-    # 2. User pin permission check (owner always allowed)
-    user_id = message.from_user.id
+
+    # User pin permission check
     if not await user_has_permission(client, message.chat.id, user_id, "can_pin_messages"):
         await message.reply_text("❌ You don't have pin permission.")
         return
-    
+
     if not await bot_has_permission(client, message.chat.id, "can_pin_messages"):
         await message.reply_text("I don't have the right to pin messages.")
-        return    
-    """Pin the replied message with notification."""
-    
+        return
+
     if not message.reply_to_message:
         await message.reply_text("Reply to a message to pin it.")
         return
+
     try:
         await message.reply_to_message.pin(disable_notification=False)
         await message.reply_text("📌 Message pinned.")
     except Exception as e:
         await message.reply_text(f"Failed to pin: {e}")
 
-async def unpin_message(client: Client, message: Message) -> None:
-    # check bot admin
+async def unpin_message(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "unpin",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
+        return
+
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
+
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
 
-    if not await require_admin(client, message):
+    # Determine user ID
+    user_id = admin_id if admin_id else message.from_user.id
+    if not user_id:
+        await message.reply_text("Could not identify admin.")
         return
-    
-    # 2. User pin permission check (owner always allowed)
-    user_id = message.from_user.id
+
+    # User pin permission check
     if not await user_has_permission(client, message.chat.id, user_id, "can_pin_messages"):
         await message.reply_text("❌ You don't have pin permission.")
         return
-    
+
     if not await bot_has_permission(client, message.chat.id, "can_pin_messages"):
         await message.reply_text("I don't have the right to pin messages.")
-        return    
-    """Unpin the latest pinned message."""
-    
-    try:
-        await client.unpin_chat_message(message.chat.id)
-        await message.reply_text("📌 Latest message unpinned.")
-    except Exception as e:
-        await message.reply_text(f"Failed to unpin: {e}")
+        return
+
+    # 🔥 FIX: Check if replying to a message (to unpin specific message)
+    if message.reply_to_message:
+        try:
+            await client.unpin_chat_message(message.chat.id, message.reply_to_message.id)
+            await message.reply_text("📌 Selected message unpinned.")
+        except Exception as e:
+            await message.reply_text(f"Failed to unpin: {e}")
+    else:
+        # If no reply, unpin the latest pinned message
+        try:
+            # Get the chat to find the pinned message
+            chat = await client.get_chat(message.chat.id)
+            if chat.pinned_message:
+                await client.unpin_chat_message(message.chat.id, chat.pinned_message.id)
+                await message.reply_text("📌 Latest pinned message unpinned.")
+            else:
+                await message.reply_text("❌ No pinned messages in this chat.")
+        except Exception as e:
+            await message.reply_text(f"Failed to unpin: {e}")
 
 # --- Bio system commands ---
-async def allow_bio_user(client: Client, message: Message):
-    # check bot admin
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-    
-    if not await require_admin(client, message):
+async def allow_bio_user(client: Client, message: Message, verified=False):
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "allow_bio",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    # Admin check (only for non‑verified)
+    if not verified:
+        if not await bot_is_admin(client, message.chat.id):
+            return await message.reply_text("❌ I am not admin.")
+        if not await require_admin(client, message):
+            return
+
     target = await get_target_user(client, message)
     if not target:
         return await message.reply_text("User not found.")
@@ -3543,38 +3789,92 @@ async def allow_bio_user(client: Client, message: Message):
     await bio_warnings_col.delete_one({"chat_id": message.chat.id, "user_id": target.id})
     await message.reply_text(f"✅ User {target.mention} whitelisted from bio/link checks.")
 
-async def unallow_bio_user(client: Client, message: Message):
-    # check bot admin
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-    
-    if not await require_admin(client, message):
+async def unallow_bio_user(client: Client, message: Message, verified=False):
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "unallow_bio",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    if not verified:
+        if not await bot_is_admin(client, message.chat.id):
+            return await message.reply_text("❌ I am not admin.")
+        if not await require_admin(client, message):
+            return
+
     target = await get_target_user(client, message)
     if not target:
         return await message.reply_text("User not found.")
     await bio_allowlist_col.delete_one({"user_id": target.id})
     await message.reply_text(f"❌ User {target.mention} removed from whitelist.")
 
-async def aplist_bio(client: Client, message: Message):
-    # check bot admin
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-    
-    if not await require_admin(client, message):
+async def aplist_bio(client: Client, message: Message, verified=False):
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "aplist_bio",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    if not verified:
+        if not await bot_is_admin(client, message.chat.id):
+            return await message.reply_text("❌ I am not admin.")
+        if not await require_admin(client, message):
+            return
+
     cursor = bio_allowlist_col.find({})
     users = [str(doc["user_id"]) async for doc in cursor]
     text = "✅ **Bio Allowed Users:**\n" + "\n".join([f"<code>{u}</code>" for u in users]) if users else "No allowed users."
     await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
 
-async def bioconfig_cmd(client: Client, message: Message):
-    # check bot admin
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-    
-    if not await require_admin(client, message):
+async def bioconfig_cmd(client: Client, message: Message, verified=False):
+    if not verified and message.from_user is None and message.sender_chat:
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "bioconfig",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+            reply_markup=keyboard
+        )
         return
+
+    if not verified:
+        if not await bot_is_admin(client, message.chat.id):
+            return await message.reply_text("❌ I am not admin.")
+        if not await require_admin(client, message):
+            return
+
     chat_id = message.chat.id
     warn_limit, action, is_enabled = await get_bio_config(chat_id)
 
@@ -3596,7 +3896,7 @@ async def bioconfig_cmd(client: Client, message: Message):
         [InlineKeyboardButton(mute_btn, callback_data="cfg_mute"), InlineKeyboardButton(ban_btn, callback_data="cfg_ban")],
         [InlineKeyboardButton("🗑 Close Menu", callback_data="del_msg")]
     ])
-    await message.reply_text(text, reply_markup=keyboard)
+    await message.reply_text(text, reply_markup=keyboard)        
 
 async def bio_and_link_scanner(client: Client, message: Message):
     if not message.from_user or message.chat.type == enums.ChatType.PRIVATE:
@@ -4224,13 +4524,22 @@ async def captcha_verify(client: Client, callback_query: CallbackQuery) -> None:
     await q.edit_message_text("Verified ✅")
 
 async def filter_handler(client: Client, message: Message):
-    if not message or not message.from_user or message.from_user.is_bot:
+    if not message:
         return
+    # Sirf bots ko skip karo
+    if message.from_user and message.from_user.is_bot:
+        return
+
     chat_id = message.chat.id
     text = (message.text or message.caption or "").lower()
     msg_text = text
-    username = (message.from_user.username or "").lower()
-    fullname = f"{message.from_user.first_name} {message.from_user.last_name or ''}".lower()
+
+    # Anonymous admin ho to username/fullname empty rakho
+    username = ""
+    fullname = ""
+    if message.from_user:
+        username = (message.from_user.username or "").lower()
+        fullname = f"{message.from_user.first_name} {message.from_user.last_name or ''}".lower()
 
     cursor = filters_col.find({"chat_id": chat_id})
     async for f in cursor:
@@ -4254,7 +4563,7 @@ async def filter_handler(client: Client, message: Message):
                 await message.reply_video(f_id, caption=cap)
             elif m_type == "animation":
                 await message.reply_animation(f_id)
-            await message.stop_propagation()  # don't process safety for this message
+            await message.stop_propagation()
             return
 
 async def safety_handler(client: Client, message: Message):
@@ -4290,11 +4599,16 @@ async def safety_handler(client: Client, message: Message):
     # Locks
     for lk in LOCK_TYPES:
         if await get_chat_setting(chat_id, f"lock_{lk}", "0") == "1":
-            if (lk == "link" and re.search(r'http[s]?://\S+', text)) or \
-               (lk == "media" and any([message.photo, message.video, message.document])) or \
-               (lk == "sticker" and message.sticker) or \
-               (lk == "gif" and message.animation) or \
-               (lk == "voice" and message.voice):
+            if (
+                (lk == "link" and re.search(r'http[s]?://\S+', text))
+                or (lk == "media" and any([message.photo, message.video, message.document]))
+                or (lk == "sticker" and message.sticker)
+                or (lk == "gif" and message.animation)
+                or (lk == "voice" and message.voice)
+                or (lk == "poll" and message.poll)
+                or (lk == "text" and (message.text or message.caption))
+                or (lk == "emoji" and (message.text or message.caption) and has_emoji(text))
+            ):
                 with suppress(Exception):
                     await message.delete()
                 await message.stop_propagation()
@@ -4872,32 +5186,6 @@ async def bio_callbacks_handler(client: Client, query: CallbackQuery):
             await bio_warnings_col.delete_one({"chat_id": chat_id, "user_id": target_id})
             await query.edit_message_text(f"🔓 User `{target_id}` Unbanned.")
 
-async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    parts = data.split(":")
-    if len(parts) != 3:
-        await callback_query.answer("Invalid data.", show_alert=True)
-        return
-
-    _, chat_id_str, user_id_str = parts
-    chat_id = int(chat_id_str)
-    user_id = int(user_id_str)
-
-    if callback_query.from_user.id != user_id:
-        await callback_query.answer("This button is not for you!", show_alert=True)
-        return
-
-    try:
-        chat = await client.get_chat(chat_id)
-    except Exception:
-        await callback_query.answer("Chat not found or inaccessible.", show_alert=True)
-        return
-
-    text = await get_adminlist_text(client, chat_id, chat.title)
-    await callback_query.message.delete()
-    await client.send_message(chat_id, text, parse_mode=enums.ParseMode.HTML)
-    await callback_query.answer()
-
 async def warnmode_callback(client: Client, callback_query: CallbackQuery):
     q = callback_query
     data = q.data
@@ -5079,14 +5367,14 @@ async def resetall_callback(client: Client, callback_query: CallbackQuery):
     action, chat_id_str = parts[1], parts[2]
     chat_id = int(chat_id_str)
 
-    # Verify user is admin in that chat
+    # 🔥 Owner check in callback
     try:
         member = await client.get_chat_member(chat_id, q.from_user.id)
-        if member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-            await q.answer("Only admins can reset warnings!", show_alert=True)
+        if member.status != enums.ChatMemberStatus.OWNER:
+            await q.answer("❌ Sirf group owner hi saare warnings reset kar sakta hai.", show_alert=True)
             return
     except Exception:
-        await q.answer("Failed to verify admin status.", show_alert=True)
+        await q.answer("❌ Owner status verify nahi ho saka.", show_alert=True)
         return
 
     if action == "cancel":
@@ -5095,14 +5383,9 @@ async def resetall_callback(client: Client, callback_query: CallbackQuery):
         return
 
     if action == "confirm":
-        # Delete all warning records for this chat
         result = await warns_col.delete_many({"chat_id": chat_id})
         deleted_count = result.deleted_count
-
-        await q.edit_message_text(
-            f"✅ All warnings reset for this group.\nDeleted {deleted_count} warning records.",
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
+        await q.edit_message_text(f"✅ All warnings reset for this group.\nDeleted {deleted_count} warning records.")
         await q.answer("✅ All warnings cleared!", show_alert=False)
 
 async def prove_warn_callback(client: Client, callback_query: CallbackQuery):
@@ -5141,6 +5424,11 @@ async def prove_warn_callback(client: Client, callback_query: CallbackQuery):
             show_alert=True
         )
 
+    # 🔥 YAHAN PERMISSION CHECK ADD KAREIN
+    if not await user_has_permission(client, chat_id, callback_query.from_user.id, "can_restrict_members"):
+        await callback_query.answer("❌ Aapke paas ban rights nahi hain (can_restrict_members permission required).", show_alert=True)
+        return
+
     action["used"] = True
 
     msg = action["message"]
@@ -5162,6 +5450,32 @@ async def prove_warn_callback(client: Client, callback_query: CallbackQuery):
         pass
 
     del pending_warn_actions[action_id]
+
+async def unapproveall_callback(client, callback_query):
+    data = callback_query.data
+    _, action, chat_id = data.split(":")
+    chat_id = int(chat_id)
+    user_id = callback_query.from_user.id
+
+    # ✅ Verify the user is the group owner
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        if member.status != enums.ChatMemberStatus.OWNER:
+            await callback_query.answer("❌ Only the group owner can confirm this.", show_alert=True)
+            return
+    except Exception:
+        await callback_query.answer("❌ Could not verify your status.", show_alert=True)
+        return
+
+    if action == "confirm":
+        result = await approved_col.delete_many({"chat_id": chat_id})
+        count = result.deleted_count
+        if count == 0:
+            await callback_query.message.edit_text("ℹ️ No approved users to remove.")
+        else:
+            await callback_query.message.edit_text(f"✅ Removed {count} approved user(s).")
+    elif action == "cancel":
+        await callback_query.message.edit_text("❌ Action cancelled.")
 
 async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
 
@@ -5192,6 +5506,22 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
             show_alert=True
         )
 
+    # --- Permission checks based on command ---
+    command = action["action"]
+    admin_id = callback_query.from_user.id
+
+    if command == "resetwarns":
+        if not await user_has_permission(client, chat_id, admin_id, "can_restrict_members"):
+            return await callback_query.answer("❌ Aapke paas ban rights nahi hain (can_restrict_members required).", show_alert=True)
+
+    elif command == "resetallwarns":
+        if member.status != enums.ChatMemberStatus.OWNER:
+            return await callback_query.answer("❌ Sirf group owner hi saare warnings reset kar sakta hai.", show_alert=True)
+
+    elif command in ["warnmode", "warntime"]:
+        if not await user_has_permission(client, chat_id, admin_id, "can_change_info"):
+            return await callback_query.answer("❌ Aapke paas 'Change Group Info' permission nahi hai.", show_alert=True)
+
     action["used"] = True
 
     msg = action["message"]
@@ -5203,25 +5533,42 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
         pass
 
     if command == "resetwarns":
-        await resetwarns(client, msg, verified=True)
+        await resetwarns(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "warninfo":
+        await warninfo_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "unmute":
         await unmute(client, msg, verified=True)
 
     if command == "resetallwarns":
-        await resetallwarns(client, msg, verified=True)
+        await resetallwarns(
+        client,
+        msg,
+        verified=True,
+        admin_id=callback_query.from_user.id
+    )
 
     elif command == "warnsettings":
         await warnsettings(client, msg, verified=True)
 
     elif command == "warnmode":
-        await warnmode_cmd(client, msg, verified=True)
+        await warnmode_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "warntime":
-        await warntime_cmd(client, msg, verified=True)
+        await warntime_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
+    elif command == "warnings":
+        await warnings(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    
     elif command == "unwarns":
-        await unwarn(client, msg, verified=True)
+        await unwarn(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "filter":
+        await filter_cmd_handler(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "stopfilter":
+        await stop_filter_handler(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "setwelcome":
         await setwelcome(client, msg, verified=True)
@@ -5254,10 +5601,10 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
         await tmute(client, msg, verified=True)
 
     elif command == "promote":
-        await promote(client, msg, verified=True)
-
+        await promote(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    
     elif command == "demote":
-        await demote(client, msg, verified=True)
+        await demote(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "ban":
         await ban(client, msg, verified=True)
@@ -5266,10 +5613,10 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
         await unban(client, msg, verified=True)
 
     elif command == "dban":
-        await ban(client, msg, verified=True)
+        await dban(client, msg, verified=True)   # msg is the original command message
 
     elif command == "sban":
-        await ban(client, msg, verified=True)
+        await sban(client, msg, verified=True)
 
     elif command == "kick":
         await kick(client, msg, verified=True)
@@ -5286,20 +5633,52 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
     elif command == "unapprove":
         await unapprove(client, msg, verified=True)
 
+    elif command == "approved":
+        await approved(client, msg, verified=True)
+
     elif command == "unapproveall":
-        await unapproveall(client, msg, verified=True)    
+        await unapproveall(
+        client,
+        msg,
+        verified=True,
+        admin_id=callback_query.from_user.id
+    )    
 
     elif command == "lock":
-        await lock(client, msg, verified=True)
+        await lock(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "unlock":
-        await unlock(client, msg, verified=True)
+        await unlock(client, msg, verified=True, admin_id=callback_query.from_user.id)
         
     elif command == "unlockall":
-        await unlockall(client, msg, verified=True)
+        await unlockall(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "lockall":
+        await lockall(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "del":
-        await del_message(client, msg, verified=True)    
+        await del_message(client, msg, verified=True) 
+
+    elif command == "pin":
+        await pin_message(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "unpin":
+        await unpin_message(client, msg, verified=True, admin_id=callback_query.from_user.id)
+       
+    elif command == "allow_bio":
+        await allow_bio_user(client, msg, verified=True)
+
+    elif command == "unallow_bio":
+        await unallow_bio_user(client, msg, verified=True)
+    
+    elif command == "aplist_bio":
+        await aplist_bio(client, msg, verified=True)
+    
+    elif command == "bioconfig":
+        await bioconfig_cmd(client, msg, verified=True)
+
+    elif command == "setrules":
+        await setrules(client, msg, verified=True)
 
     del pending_admin_actions[action_id]
 
@@ -5329,6 +5708,25 @@ async def proveatag_callback(client: Client, callback_query: CallbackQuery):
     # Continue with normal tagging
     await _utag_main(client, action["message"])
 
+async def custom_command_dispatcher(client: Client, message: Message):
+    # Full command text (without /)
+    full_cmd = message.text[1:].lower().strip()
+    
+    # 1. Pehle exact match check karo (jaise "lock all")
+    if full_cmd in COMMAND_HANDLERS:
+        func = COMMAND_HANDLERS[full_cmd]
+        await func(client, message, verified=False, admin_id=None)
+        return
+    
+    # 2. Exact match na mile to first word match karo (jaise "lock")
+    first_word = full_cmd.split()[0]
+    if first_word in COMMAND_HANDLERS:
+        func = COMMAND_HANDLERS[first_word]
+        await func(client, message, verified=False, admin_id=None)
+        return
+    
+    # 3. Kuch match na ho to ignore (ya error message)
+    await message.reply_text("Command not found.")
 
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
@@ -5364,8 +5762,20 @@ def main():
         "filters": list_filters_handler,
     }
 
+    # Multi-word commands (jinhe exact match chahiye)
+    multi_word_commands = {
+        "lock all": lockall,
+        "unlock all": unlockall,
+    }
+
+    # Final COMMAND_HANDLERS dictionary
+    COMMAND_HANDLERS = {**commands, **multi_word_commands}
+
     for name, fn in commands.items():
         app.add_handler(MessageHandler(fn, filters.command(name)))
+
+    # Custom command dispatcher handler
+    app.add_handler(MessageHandler(custom_command_dispatcher, filters.command(list(set(cmd.split()[0] for cmd in COMMAND_HANDLERS)))))
 
     # Callback handlers
     app.add_handler(CallbackQueryHandler(start_buttons, filters.regex(r"^start:")))
@@ -5385,7 +5795,8 @@ def main():
     app.add_handler(CallbackQueryHandler(prove_warn_callback,filters.regex("^provewarn:")))  
     app.add_handler(CallbackQueryHandler(proveatag_callback,filters.regex("^proveatag:"))) 
     app.add_handler(CallbackQueryHandler(join_request_callback, filters.regex(r"^jr:")))
-    
+    app.add_handler(CallbackQueryHandler(unapproveall_callback, filters.regex(r"^unapproveall:")))
+
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
     app.add_handler(MessageHandler(on_left_member, filters.left_chat_member))
