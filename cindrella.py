@@ -6,6 +6,8 @@ import uuid
 from collections import defaultdict, deque
 from contextlib import suppress
 from datetime import datetime, timedelta
+from pyrogram import Client, filters
+from pyrogram.enums import ChatType
 from html import escape
 from pyrogram.types import ChatPrivileges
 from io import BytesIO
@@ -14,7 +16,7 @@ from pyrogram.handlers import ChatJoinRequestHandler
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, enums, filters, idle
-from pyrogram.errors import BadRequest, FloodWait
+from pyrogram.errors import BadRequest, FloodWait, MessageNotModified
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import (
     CallbackQuery,
@@ -104,14 +106,16 @@ pending_admin_actions = {}
 PENDING_ACTION_TIMEOUT = 300  # 5 minutes
 ANONYMOUS_ADMIN_ID = 1087968824
 # --- Global tracking structures ---
-
+pending_floodmode = {}  # key: unique_id, value: {chat_id, user_id, action, duration_str, message_id}
 active_tagging = {}
 purge_running = {}
 FLOOD_WINDOW_SEC = 7
 FLOOD_LIMIT = 6
+FLOOD_WINDOW = 10          # seconds
 flood_tracker: dict[tuple[int, int], deque] = defaultdict(deque)
 LOCK_TYPES = {"media", "sticker", "gif", "voice", "poll", "link", "emoji", "text"}
 active_users: dict[int, deque[int]] = defaultdict(lambda: deque(maxlen=300))
+flood_timer_tracker: dict[tuple[int, int], list] = defaultdict(list)
 
 # --- Language support (English only now, but structure kept for future) ---
 LANG = {
@@ -126,7 +130,7 @@ LANG = {
 HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "home": ("📚 Help Menu", "Select any category button below."),
     "admin": ("👮 ADMIN", "/adminlist /promote /demote /setgtitle /setgpic /setgdesc /admincache"),
-    "antiflood": ("🌊 ANTIFLOOD", "/flood on|off /setflood <number> /setfloodmode <mute|ban|kick|delete> /clearflood on|off /antiraid on|off"),
+    "antiflood": ("🌊 ANTIFLOOD", "/flood on|off  /setfloodmode <mute|ban|kick|delete> /clearflood on|off /antiraid on|off"),
     "approval": ("✅ APPROVAL", "/approve /unapprove /approved"),
     "bans": ("🔨 BANS", "/ban /sban /dban /tban /unban /kickme /kick /dkick /skick"),
     "blocklist": ("🚫 BLOCKLIST", "/blocklist /addblock /unblock /blocklistmode <action>"),
@@ -214,6 +218,83 @@ def get_filter_data(message: Message):
     return None
 
 # --- MongoDB helper functions ---
+def get_clearflood_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    """Build the clearflood inline keyboard with green tick when enabled."""
+    enable_text = "✅ Enable" if enabled else "Enable"
+    disable_text = "Disable" if enabled else "❌ Disable"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(enable_text, callback_data="clearflood:enable"),
+         InlineKeyboardButton(disable_text, callback_data="clearflood:disable")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="clearflood:refresh")],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+
+async def is_flood_enabled(chat_id: int) -> bool:
+    """Return True if any flood control mode is active."""
+    doc = await chat_settings_col.find_one({"chat_id": chat_id})
+    if not doc:
+        return False
+    return doc.get("flood_enabled", "0") == "1" or doc.get("flood_timer_enabled", "0") == "1"
+
+async def get_flood_mode(chat_id: int) -> tuple[str, dict]:
+    """Return (mode, params) where mode is 'timer' or 'consecutive' and params are the settings."""
+    doc = await chat_settings_col.find_one({"chat_id": chat_id})
+    if not doc:
+        return "consecutive", {"limit": 5, "window": 10}
+    if doc.get("flood_timer_enabled", "0") == "1":
+        count = int(doc.get("flood_timer_count", "5"))
+        seconds = int(doc.get("flood_timer_seconds", "10"))
+        return "timer", {"count": count, "seconds": seconds}
+    else:
+        limit = int(doc.get("flood_limit", "5"))
+        window = FLOOD_WINDOW   # global constant
+        return "consecutive", {"limit": limit, "window": window}
+
+def get_floodcontrol_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    """Build the flood control inline keyboard based on current state."""
+    enable_text = "✅ Enable" if enabled else "Enable"
+    disable_text = "Disable" if enabled else "❌ Disable"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(enable_text, callback_data="flood_enable"),
+         InlineKeyboardButton(disable_text, callback_data="flood_disable")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="flood_refresh")],
+    ])
+
+def build_number_pad(current_duration: str) -> InlineKeyboardMarkup:
+    """Create a number pad keyboard with digits, clear, back, and OK buttons."""
+    rows = []
+    for i in range(1, 10, 3):
+        row = []
+        for j in range(3):
+            digit = str(i + j)
+            row.append(InlineKeyboardButton(digit, callback_data=f"floodmode_digit:{digit}"))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("0", callback_data="floodmode_digit:0"),
+        InlineKeyboardButton("⌫ Clear", callback_data="floodmode_clear")
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="floodmode_back"),
+        InlineKeyboardButton("✅ OK", callback_data="floodmode_ok")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+def get_floodcontrol_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    """Build the flood control inline keyboard based on current state."""
+    enable_text = "✅ Enable" if enabled else "Enable"
+    disable_text = "Disable" if enabled else "❌ Disable"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(enable_text, callback_data="flood_enable"),
+         InlineKeyboardButton(disable_text, callback_data="flood_disable")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="flood_refresh")],
+    ])
+
+async def get_quietfed_enabled(chat_id: int) -> bool:
+    return await get_chat_setting(chat_id, "quietfed_enabled", "0") == "1"
+
+async def set_quietfed_enabled(chat_id: int, enabled: bool) -> None:
+    await set_chat_setting(chat_id, "quietfed_enabled", to_bool_str(enabled))
+
 async def get_anonadmin_enabled(chat_id: int) -> bool:
     return await get_chat_setting(chat_id, "anonadmin_enabled", "0") == "1"
 
@@ -897,6 +978,15 @@ async def can_manage_filters(client: Client, message: Message, admin_id: int = N
     return False
 
 async def filter_cmd_handler(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         # Check if anonymous admin mode is enabled for this chat
@@ -954,6 +1044,15 @@ async def filter_cmd_handler(client: Client, message: Message, verified=False, a
     await message.reply_text(f"✅ Filter saved for: **{keyword}**")
 
 async def stop_filter_handler(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await stop_filter_handler(client, message, verified=True, admin_id=0)
@@ -994,6 +1093,11 @@ async def stop_filter_handler(client: Client, message: Message, verified=False, 
         await message.reply_text(f"No filter found with keyword: `{keyword}`")
 
 async def list_filters_handler(client: Client, message: Message):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     filters_list = await filters_col.find({"chat_id": message.chat.id}).to_list(length=100)
     if not filters_list:
         return await message.reply_text("No filters in this group.")
@@ -1066,6 +1170,11 @@ async def setwelcome(client: Client, message: Message, verified=False) -> None:
     await message.reply_text("✅ Welcome message set and enabled.")
 
 async def resetwelcome(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await resetwelcome(client, message, verified=True)
@@ -1096,6 +1205,11 @@ async def resetwelcome(client: Client, message: Message, verified=False) -> None
     await message.reply_text("✅ Welcome reset to default.")
 
 async def welcome_toggle(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await welcome_toggle(client, message, verified=True)
@@ -1130,6 +1244,11 @@ async def welcome_toggle(client: Client, message: Message, verified=False) -> No
     await message.reply_text(f"Welcome {'enabled' if enabled else 'disabled'}.")
 
 async def setgoodbye(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await setgoodbye(client, message, verified=True)
@@ -1193,6 +1312,11 @@ async def setgoodbye(client: Client, message: Message, verified=False) -> None:
     await message.reply_text("✅ Goodbye message set and enabled.")
 
 async def resetgoodbye(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await resetgoodbye(client, message, verified=True)
@@ -1223,6 +1347,11 @@ async def resetgoodbye(client: Client, message: Message, verified=False) -> None
     await message.reply_text("✅ Goodbye reset to default.")
 
 async def goodbye_toggle(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await goodbye_toggle(client, message, verified=True)
@@ -1287,14 +1416,21 @@ async def send_welcome_goodbye(client, chat_id, user, data, reply_to_message_id=
 
 async def on_new_members(client: Client, message: Message) -> None:
     chat_id = message.chat.id
-    settings = await get_chat_settings(chat_id)
-    if not settings.get("welcome_enabled", False):
-        return
-    welcome_data = settings.get("welcome", {})
     for member in message.new_chat_members:
         if member.is_bot:
             continue
-        await send_welcome_goodbye(client, chat_id, member, welcome_data, reply_to_message_id=message.id)
+
+        # 1. ALWAYS check fedban before anything else
+        banned = await check_and_punish_fedbanned_user(client, chat_id, member.id, message)
+        if banned:
+            # User was banned, skip everything (welcome, etc.)
+            continue
+
+        # 2. Only after fedban check, handle welcome if enabled
+        settings = await get_chat_settings(chat_id)
+        if settings.get("welcome_enabled", False):
+            welcome_data = settings.get("welcome", {})
+            await send_welcome_goodbye(client, chat_id, member, welcome_data, reply_to_message_id=message.id)
 
 async def on_left_member(client: Client, event):
     if isinstance(event, Message):
@@ -1321,6 +1457,15 @@ async def on_left_member(client: Client, event):
         await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message_id)
 
 async def setrules(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1375,6 +1520,15 @@ async def setrules(client: Client, message: Message, verified=False) -> None:
     
 
 async def rules(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+                                        
     chat_id = message.chat.id
     if message.chat.type != enums.ChatType.PRIVATE:
         me = await client.get_me()
@@ -1389,6 +1543,15 @@ async def rules(client: Client, message: Message) -> None:
             await message.reply_text("No rules set for this chat.")
 
 async def setnote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1430,6 +1593,15 @@ async def setnote(client: Client, message: Message, verified=False, admin_id: in
     await message.reply_text("Note saved.")
 
 async def delnote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1465,6 +1637,15 @@ async def delnote(client: Client, message: Message, verified=False, admin_id: in
     await message.reply_text("Note deleted.")    
 
 async def get_note(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     args = get_args(message)
     if not args:
         return
@@ -1474,6 +1655,7 @@ async def get_note(client: Client, message: Message) -> None:
         await message.reply_text(doc["content"], parse_mode=enums.ParseMode.HTML)
 
 async def warn_common(client: Client, message: Message, delete_cmd: bool = False, silent: bool = False, delete_replied: bool = False, admin_id: int = None) -> None:
+    
     target = await get_target_user(client, message)
     if not target:
         await message.reply_text("User not found.")
@@ -1597,6 +1779,15 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
             await message.delete()
             
 async def warnsettings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1644,6 +1835,15 @@ async def warnsettings(client: Client, message: Message, verified=False, admin_i
     await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
 
 async def warntime_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     if not verified:
         if not await require_admin_proof(client, message, "warntime"):
             return
@@ -1675,6 +1875,15 @@ async def warntime_cmd(client: Client, message: Message, verified=False, admin_i
     await message.reply_text("✅ Warning expiry updated.")
 
 async def warnmode_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1740,6 +1949,15 @@ async def warnmode_cmd(client: Client, message: Message, verified=False, admin_i
     await message.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
     
 async def resetallwarns(client: Client, message: Message, verified=False, admin_id=None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1806,6 +2024,15 @@ async def resetallwarns(client: Client, message: Message, verified=False, admin_
     )
 
 async def resetwarns(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1870,6 +2097,15 @@ async def resetwarns(client: Client, message: Message, verified=False, admin_id:
     await message.reply_text(f"✅ All warnings reset for {target.mention}.")    
 
 async def warninfo_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -1968,6 +2204,15 @@ async def warninfo_cmd(client: Client, message: Message, verified=False, admin_i
 pending_warn_actions = {}
 
 async def warn(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # anonymous admin detection
     if message.from_user is None and message.sender_chat:
         target = await get_target_user(client, message)
@@ -2118,6 +2363,15 @@ async def swarn(client: Client, message: Message) -> None:
     await warn_common(client, message, delete_cmd=True, silent=True, delete_replied=False)
 
 async def warnings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2191,6 +2445,15 @@ async def warnings(client: Client, message: Message, verified=False, admin_id: i
     await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
 
 async def unwarn(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     if not verified:
         if not await require_admin_proof(client, message, "unwarns"):
             return
@@ -2266,6 +2529,15 @@ async def do_restrict(client: Client, message: Message, mode: str) -> None:
             await message.delete()
 
 async def mute(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2326,6 +2598,15 @@ async def mute(client: Client, message: Message, verified=False, admin_id: int =
     await message.reply_text(f"🔇 {target.mention} muted.")
 
 async def dmute(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2403,6 +2684,15 @@ async def dmute(client: Client, message: Message, verified=False, admin_id: int 
         pass
 
 async def smute(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2464,6 +2754,15 @@ async def smute(client: Client, message: Message, verified=False, admin_id: int 
     )    
 
 async def tmute(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2533,6 +2832,15 @@ async def tmute(client: Client, message: Message, verified=False, admin_id: int 
     await message.reply_text(f"🔇 {target.mention} muted for {args[0]}.")          
 
 async def unmute(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2610,6 +2918,16 @@ async def unmute(client: Client, message: Message, verified=False, admin_id: int
         await message.reply_text(f"Error: {e}")
 
 async def ban(client: Client, message: Message, verified=False, admin_id: int = None):
+    
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2657,6 +2975,15 @@ async def ban(client: Client, message: Message, verified=False, admin_id: int = 
     await message.reply_text(f"{user.mention} banned.")
 
 async def dban(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2683,9 +3010,6 @@ async def dban(client: Client, message: Message, verified=False, admin_id: int =
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
-
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
 
     # Check bot has restrict permission
     if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
@@ -2724,6 +3048,15 @@ async def dban(client: Client, message: Message, verified=False, admin_id: int =
         await message.reply_text(f"❌ Failed to ban: {e}")
 
 async def sban(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2751,9 +3084,6 @@ async def sban(client: Client, message: Message, verified=False, admin_id: int =
         if not await require_admin(client, message):
             return
 
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-
     if not await check_ban_permissions(client, message):
         return
 
@@ -2769,6 +3099,15 @@ async def sban(client: Client, message: Message, verified=False, admin_id: int =
     await client.ban_chat_member(message.chat.id, user.id)
 
 async def tban(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2820,6 +3159,15 @@ async def tban(client: Client, message: Message, verified=False, admin_id: int =
     await message.reply_text(f"{user.mention} banned for {duration//3600} hour(s).")
 
 async def unban(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2847,9 +3195,6 @@ async def unban(client: Client, message: Message, verified=False, admin_id: int 
         if not await require_admin(client, message):
             return
 
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-
     if not await check_ban_permissions(client, message):
         return
 
@@ -2868,6 +3213,15 @@ async def unban(client: Client, message: Message, verified=False, admin_id: int 
     await message.reply_text(f"{user.mention} unbanned.")
 
 async def kick(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2895,9 +3249,6 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
         if not await require_admin(client, message):
             return
 
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-
     if not await check_ban_permissions(client, message):
         return
 
@@ -2915,6 +3266,15 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
     await message.reply_text(f"{user.mention} kicked.")
 
 async def skick(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2942,9 +3302,6 @@ async def skick(client: Client, message: Message, verified=False, admin_id: int 
         if not await require_admin(client, message):
             return
 
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
-
     if not await check_ban_permissions(client, message):
         return
 
@@ -2957,6 +3314,15 @@ async def skick(client: Client, message: Message, verified=False, admin_id: int 
     await client.unban_chat_member(message.chat.id, user.id)
 
 async def dkick(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -2983,9 +3349,6 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
-
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
 
     if not await check_ban_permissions(client, message):
         return
@@ -3020,6 +3383,11 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
 
 
 async def kickme(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
     
@@ -3032,6 +3400,15 @@ async def kickme(client: Client, message: Message) -> None:
     await message.reply_text("You have left the group.")
 
 async def lock(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3114,6 +3491,15 @@ async def lock(client: Client, message: Message, verified=False, admin_id: int =
     await message.reply_text(f"🔒 `{lock_type}` locked.")
 
 async def unlock(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3196,6 +3582,15 @@ async def unlock(client: Client, message: Message, verified=False, admin_id: int
 
 async def lockall(client: Client, message: Message, verified=False, admin_id=None):
 
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin proof
     if not verified:
         if not await require_admin_proof(client, message, "lockall"):
@@ -3227,6 +3622,14 @@ async def lockall(client: Client, message: Message, verified=False, admin_id=Non
         await message.reply_text(f"Error: {e}")
 
 async def unlockall(client: Client, message: Message, verified=False, admin_id=None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
 
     # Anonymous admin proof
     if not verified:
@@ -3261,13 +3664,15 @@ async def unlockall(client: Client, message: Message, verified=False, admin_id=N
 async def cleanservice(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     await generic_toggle(client, message, "clean_service", "cleanservice", verified, admin_id)
 
-async def flood_toggle(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    await generic_toggle(client, message, "flood_enabled", "flood", verified, admin_id)
-
 async def captcha_toggle(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     await generic_toggle(client, message, "captcha_enabled", "captcha", verified, admin_id)
 
 async def approve(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Bot admin check
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin here.")
@@ -3348,6 +3753,11 @@ async def approve(client: Client, message: Message, verified=False) -> None:
 
 
 async def unapprove(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Bot admin check
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin here.")
@@ -3424,6 +3834,11 @@ async def unapprove(client: Client, message: Message, verified=False) -> None:
 
 
 async def unapproveall(client: Client, message: Message, verified=False, admin_id=None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3489,6 +3904,15 @@ async def unapproveall(client: Client, message: Message, verified=False, admin_i
     )
 
 async def approved(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3514,9 +3938,6 @@ async def approved(client: Client, message: Message, verified=False) -> None:
             )
             return
 
-    # Bot admin check
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin here.")
     
     # Admin check - normal admin ke liye
     if not verified:
@@ -3540,6 +3961,15 @@ async def approved(client: Client, message: Message, verified=False) -> None:
         await message.reply_text("No approved users.")
 
 async def approval(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     """Check if a user is approved in this chat."""
     chat_id = message.chat.id
     target = await get_target_user(client, message)
@@ -3579,6 +4009,11 @@ async def approval(client: Client, message: Message) -> None:
 
 async def adminlist(client: Client, message: Message) -> None:
 
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
     chat_id = message.chat.id
     chat_title = message.chat.title
 
@@ -3590,8 +4025,14 @@ async def adminlist(client: Client, message: Message) -> None:
     )
 
 async def promote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
     if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
+        return await message.reply_text("❌ I am not admin in this chat.")
     
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3668,8 +4109,14 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text(f"Failed to promote: {e}")
 
 async def demote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
     if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
+        return await message.reply_text("❌ I am not admin in this chat.")
     
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3739,6 +4186,11 @@ async def demote(client: Client, message: Message, verified=False, admin_id: int
         await message.reply_text(f"Failed to demote: {e}")
 
 async def setgpic(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3779,6 +4231,11 @@ async def setgpic(client: Client, message: Message, verified=False, admin_id: in
 
 
 async def delgpic(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3816,6 +4273,11 @@ async def delgpic(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text(f"Failed to delete photo: {e}")
 
 async def setgdesc(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3854,6 +4316,11 @@ async def setgdesc(client: Client, message: Message, verified=False, admin_id: i
     await message.reply_text("Group description updated.")
 
 async def delgdesc(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3891,6 +4358,11 @@ async def delgdesc(client: Client, message: Message, verified=False, admin_id: i
         await message.reply_text(f"Failed to clear description: {e}")
 
 async def setgtitle(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3939,6 +4411,11 @@ async def setgtitle(client: Client, message: Message, verified=False, admin_id: 
         await message.reply_text(f"Failed to update title: {e}")
 
 async def resetgtitle(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -3982,6 +4459,11 @@ async def resetgtitle(client: Client, message: Message, verified=False, admin_id
         await message.reply_text(f"Failed to reset title: {e}") 
 
 async def admincache(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -4033,17 +4515,26 @@ async def admincache(client: Client, message: Message, verified=False, admin_id:
     await set_last_admincache(chat_id, now)
     await message.reply_text(f"Admin cache refreshed: {len(admins)} admins")
 
-async def setflood(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    # Anonymous admin detection
+async def floodcontrol_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+    # Anonymous admin detection (unchanged)
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
-            return await setflood(client, message, verified=True, admin_id=0)
+            return await floodcontrol_cmd(client, message, verified=True, admin_id=0)
         else:
             action_id = str(uuid.uuid4())
             pending_admin_actions[action_id] = {
                 "chat_id": message.chat.id,
                 "message": message,
-                "action": "setflood",
+                "action": "floodcontrol",
                 "time": time.time(),
                 "used": False
             }
@@ -4056,23 +4547,126 @@ async def setflood(client: Client, message: Message, verified=False, admin_id: i
             )
             return
 
+    # Admin check for normal users
+    if not (verified and message.from_user is None):
+        if not await require_admin(client, message):
+            return
+    
+    chat_id = message.chat.id
+    enabled = await is_flood_enabled(chat_id)
+    mode, params = await get_flood_mode(chat_id)
+
+    if enabled:
+        if mode == "timer":
+            status_text = (
+                f"🟢 Flood control is **enabled** in {message.chat.title} (Timer Mode)\n"
+                f"Users sending **{params['count']}** or more messages within **{params['seconds']}** seconds will be punished.\n"
+                f"Current action: {await get_chat_setting(chat_id, 'flood_mode', 'mute')}"
+            )
+        else:
+            status_text = (
+                f"🟢 Flood control is **enabled** in {message.chat.title} (Consecutive Mode)\n"
+                f"Users sending **{params['limit']}** or more consecutive messages within **{params['window']}** seconds will be punished.\n"
+                f"Current action: {await get_chat_setting(chat_id, 'flood_mode', 'mute')}"
+            )
+    else:
+        status_text = (
+            f"🔴 Flood control is **disabled** in {message.chat.title}.\n"
+            "This chat is not currently enforcing flood control."
+        )
+
+    keyboard = get_floodcontrol_keyboard(enabled)
+    await message.reply_text(status_text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+
+async def setfloodtimer_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        if await get_anonadmin_enabled(message.chat.id):
+            return await setfloodtimer_cmd(client, message, verified=True, admin_id=0)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_admin_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "action": "setfloodtimer",
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+            ]])
+            await message.reply_text(
+                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+                reply_markup=keyboard
+            )
+            return
+
+    # Admin check for normal users
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
 
-    args = get_args(message)
-    if not args or not args[0].isdigit():
-        await message.reply_text("Usage: /setflood <number>")
-        return
-    limit = max(2, int(args[0]))
-    await set_chat_setting(message.chat.id, "flood_limit", str(limit))
-    await message.reply_text(f"Flood limit set to {limit}")
+    # --- NEW: Bot must be admin and have delete messages permission ---
+    if not await bot_has_permission(client, message.chat.id, "can_delete_messages"):
+        return await message.reply_text(f"❌ I don't have message deleting rights in {message.chat.title}.")
 
-async def setfloodmode(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    args = get_args(message)
+    if not args:
+        await message.reply_text("Usage: /setfloodtimer <count> <seconds>   or   /setfloodtimer off")
+        return
+
+    if args[0].lower() == "off":
+        await set_chat_setting(message.chat.id, "flood_timer_enabled", "0")
+        await message.reply_text("⏱️ Timed antiflood has been disabled. The chat will now use the default consecutive flood limit.")
+        return
+
+    if len(args) < 2:
+        await message.reply_text("Usage: /setfloodtimer <count> <seconds>")
+        return
+
+    try:
+        count = int(args[0])
+        seconds = int(args[1])
+        if count < 1 or seconds < 1:
+            raise ValueError
+    except ValueError:
+        await message.reply_text("Both count and seconds must be positive integers.")
+        return
+
+    # Save timer settings
+    await set_chat_setting(message.chat.id, "flood_timer_enabled", "1")
+    await set_chat_setting(message.chat.id, "flood_timer_count", str(count))
+    await set_chat_setting(message.chat.id, "flood_timer_seconds", str(seconds))
+
+    # Clear the consecutive flood settings to avoid confusion (optional)
+    await set_chat_setting(message.chat.id, "flood_enabled", "0")  # disable old mode
+
+    await message.reply_text(
+        f"✅ Timed antiflood setting for {message.chat.title} has been updated to **{count}** messages every **{seconds}** seconds.\n"
+        f"Users exceeding this will be punished according to the configured flood mode."
+    )
+
+async def setfloodmode_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
-            return await setfloodmode(client, message, verified=True, admin_id=0)
+            return await setfloodmode_cmd(client, message, verified=True, admin_id=0)
         else:
             action_id = str(uuid.uuid4())
             pending_admin_actions[action_id] = {
@@ -4091,21 +4685,125 @@ async def setfloodmode(client: Client, message: Message, verified=False, admin_i
             )
             return
 
+    # For normal users or verified anonymous, require admin
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
 
-    allowed = {"mute", "ban", "kick", "delete"}
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
+        return await message.reply_text(f"❌ I don't have member restricting rights in {message.chat.title}.")
+
+    # If arguments are provided, use the old text mode
     args = get_args(message)
-    if not args or args[0].lower() not in allowed:
-        await message.reply_text("Usage: /setfloodmode <mute|ban|kick|delete>")
+    if args:
+        allowed = {"mute", "ban", "kick", "tban", "tmute"}
+        action = args[0].lower()
+        if action not in allowed:
+            await message.reply_text("Usage: /setfloodmode <mute|ban|kick|tban|tmute> [duration]")
+            return
+        if action in ("tban", "tmute"):
+            if len(args) < 2:
+                await message.reply_text("Please provide a duration for temporary action (e.g., 1h, 30m, 2d)")
+                return
+            duration = parse_duration(args[1])
+            if duration == 0:
+                await message.reply_text("Invalid duration format. Use: 1h, 30m, 2d, etc.")
+                return
+            await set_chat_setting(message.chat.id, "flood_mode", action)
+            await set_chat_setting(message.chat.id, "flood_duration", str(duration))
+            await message.reply_text(f"Flood mode set to {action} with duration {args[1]}")
+        else:
+            await set_chat_setting(message.chat.id, "flood_mode", action)
+            await message.reply_text(f"Flood mode set to {action}")
         return
-    mode = args[0].lower()
-    await set_chat_setting(message.chat.id, "flood_mode", mode)
-    await message.reply_text(f"Flood mode set: {mode}")
+
+    chat_id = message.chat.id
+    current_action = await get_chat_setting(chat_id, "flood_mode", "mute")
+    current_duration_sec = int(await get_chat_setting(chat_id, "flood_duration", "60"))
+    current_duration_min = current_duration_sec // 60   # show minutes
+
+    actions = [
+        ("mute", "🔇 Mute"),
+        ("ban", "🚫 Ban"),
+        ("kick", "👢 Kick"),
+        ("tban", "⏱️ Tban"),
+        ("tmute", "⏱️ Tmute")
+    ]
+    keyboard = []
+    row = []
+    for a, label in actions:
+        display = f"✅ {label}" if a == current_action else label
+        row.append(InlineKeyboardButton(display, callback_data=f"setfloodmode_action:{a}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🗑 Close", callback_data="del_msg")])
+    await message.reply_text(
+        f"**Current flood mode:** {current_action.upper()}\n"
+        f"**Duration (for tban/tmute):** {current_duration_min} minute(s)\n\n"
+        f"Select new flood action:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
 
 async def clearflood(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    await generic_toggle(client, message, "clear_flood_enabled", "clearflood", verified, admin_id)
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    # Bot admin check
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        if await get_anonadmin_enabled(message.chat.id):
+            return await clearflood(client, message, verified=True, admin_id=0)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_admin_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "action": "clearflood",
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+            ]])
+            await message.reply_text(
+                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+                reply_markup=keyboard
+            )
+            return
+
+    # Admin check for normal users
+    if not (verified and message.from_user is None):
+        if not await require_admin(client, message):
+            return
+
+    # Bot delete permission check
+    if not await bot_has_permission(client, message.chat.id, "can_delete_messages"):
+        return await message.reply_text(f"❌ I don't have message deleting rights in {message.chat.title}.")
+
+    chat_id = message.chat.id
+    enabled = await get_chat_setting(chat_id, "clear_flood_enabled", "1") == "1"   # default ON
+
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    description = (
+        f"Antiflood clearing is currently **{status}** in {message.chat.title}. "
+        "When someone floods, all their flood messages will be automatically deleted."
+        if enabled else
+        f"Antiflood clearing is currently **{status}** in {message.chat.title}. "
+        "When someone floods, their flood messages will NOT be automatically deleted."
+    )
+
+    keyboard = get_clearflood_keyboard(enabled)
+    await message.reply_text(description, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
 
 
 async def id_cmd(client: Client, message: Message) -> None:
@@ -4262,6 +4960,11 @@ async def info(client: Client, message: Message) -> None:
             await message.reply_text(text, parse_mode=enums.ParseMode.HTML)        
 
 async def report(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not message.reply_to_message:
         await message.reply_text("Reply to a message to report it.")
         return
@@ -4273,6 +4976,11 @@ ADMIN_COOLDOWN_TIME = 30
 
 async def admins_cmd(client: Client, message: Message):
 
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else None
 
@@ -4320,6 +5028,11 @@ async def formatting(client: Client, message: Message) -> None:
     )
 
 async def purge(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -4368,6 +5081,11 @@ async def purge(client: Client, message: Message, verified=False, admin_id: int 
     asyncio.create_task(delete_after_delay(result, 5))
     
 async def spurge(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await spurge(client, message, verified=True, admin_id=0)
@@ -4409,6 +5127,11 @@ async def spurge(client: Client, message: Message, verified=False, admin_id: int
     await message.delete()
 
 async def purge_amount(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await purge_amount(client, message, verified=True, admin_id=0)
@@ -4458,6 +5181,11 @@ async def purge_amount(client: Client, message: Message, verified=False, admin_i
     asyncio.create_task(delete_after_delay(result, 5))
 
 async def purgeuser(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await purgeuser(client, message, verified=True, admin_id=0)
@@ -4514,6 +5242,11 @@ async def purgeuser(client: Client, message: Message, verified=False, admin_id: 
     asyncio.create_task(delete_after_delay(result, 5))
 
 async def purgebots(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await purgebots(client, message, verified=True, admin_id=0)
@@ -4561,6 +5294,11 @@ async def purgebots(client: Client, message: Message, verified=False, admin_id: 
     asyncio.create_task(delete_after_delay(result, 5))
 
 async def purgemedia(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await purgemedia(client, message, verified=True, admin_id=0)
@@ -4608,6 +5346,11 @@ async def purgemedia(client: Client, message: Message, verified=False, admin_id:
     asyncio.create_task(delete_after_delay(result, 5))
 
 async def purgelinks(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await purgelinks(client, message, verified=True, admin_id=0)
@@ -4655,6 +5398,11 @@ async def purgelinks(client: Client, message: Message, verified=False, admin_id:
     asyncio.create_task(delete_after_delay(result, 5))
 
 async def fastpurge(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await fastpurge(client, message, verified=True, admin_id=0)
@@ -4702,6 +5450,11 @@ async def fastpurge(client: Client, message: Message, verified=False, admin_id: 
     asyncio.create_task(delete_after_delay(result, 5))
 
 async def cancelpurge(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await cancelpurge(client, message, verified=True, admin_id=0)
@@ -4742,6 +5495,11 @@ async def cancelpurge(client: Client, message: Message, verified=False, admin_id
     asyncio.create_task(delete_after_delay(result, 5))                        
 
 async def del_message(client: Client, message: Message, verified=False) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     """Delete the replied message."""
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
@@ -4809,6 +5567,16 @@ async def del_message(client: Client, message: Message, verified=False) -> None:
         await message.reply_text(f"Failed to delete: {e}")
 
 async def pin_message(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -4830,9 +5598,6 @@ async def pin_message(client: Client, message: Message, verified=False, admin_id
                 reply_markup=keyboard
             )
             return
-
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
 
     # Determine user ID
     if admin_id is not None:
@@ -4865,6 +5630,15 @@ async def pin_message(client: Client, message: Message, verified=False, admin_id
         await message.reply_text(f"Failed to pin: {e}")
 
 async def unpin_message(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -4891,9 +5665,6 @@ async def unpin_message(client: Client, message: Message, verified=False, admin_
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
-
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
 
     # Determine user ID
     if admin_id is not None:
@@ -4935,6 +5706,16 @@ async def unpin_message(client: Client, message: Message, verified=False, admin_
             await message.reply_text(f"Failed to unpin: {e}")
 
 async def spin_message(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -4956,9 +5737,6 @@ async def spin_message(client: Client, message: Message, verified=False, admin_i
                 reply_markup=keyboard
             )
             return
-
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin.")
 
     # Determine user ID
     if admin_id is not None:
@@ -4993,6 +5771,16 @@ async def spin_message(client: Client, message: Message, verified=False, admin_i
         await message.reply_text(f"Failed to pin: {e}")
 
 async def pinned_cmd(client: Client, message: Message):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     """Get the current pinned message in the group. Works for all users."""
     chat = message.chat
     if chat.type not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
@@ -5086,6 +5874,16 @@ async def pinned_cmd(client: Client, message: Message):
 
 # Updated unpinall_message function
 async def unpinall_message(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     """Unpin all pinned messages in the group (admin only) with confirmation."""
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
@@ -5113,10 +5911,6 @@ async def unpinall_message(client: Client, message: Message, verified=False, adm
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
-
-    # Bot must be admin
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin here.")
 
     # Determine user ID
     if admin_id is not None:
@@ -5181,6 +5975,16 @@ def parse_button(text: str):
     return clean_text, buttons
 
 async def permapin_command(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     """Send a custom pinned message (admin only)."""
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
@@ -5208,10 +6012,6 @@ async def permapin_command(client: Client, message: Message, verified=False, adm
     if not verified:
         if not await require_admin(client, message):
             return
-
-    # Bot must be admin
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin here.")
 
     # Determine user ID for permission check
     user_id = admin_id if admin_id else (message.from_user.id if message.from_user else None)
@@ -5277,17 +6077,26 @@ async def permapin_command(client: Client, message: Message, verified=False, adm
     # Pin it and store in database
     try:
         await sent.pin(disable_notification=True)
-        # Store in permapin collection
         await permapin_messages_col.update_one(
             {"chat_id": message.chat.id, "message_id": sent.id},
             {"$set": {"chat_id": message.chat.id, "message_id": sent.id}},
             upsert=True
         )
+        await set_chat_setting(message.chat.id, "permapin_id", str(sent.id))   # <-- NEW
         await message.reply_text("✅ Message pinned permanently.")
     except Exception as e:
         await message.reply_text(f"❌ Failed to pin: {e}")
 
 async def antichannelpin_command(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -5343,6 +6152,15 @@ async def antichannelpin_command(client: Client, message: Message, verified=Fals
     )
 
 async def cleanlinked_command(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -5398,6 +6216,16 @@ async def cleanlinked_command(client: Client, message: Message, verified=False, 
     )
 
 async def anonadmin_command(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # Anonymous admin detection for owner verification
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -5462,6 +6290,16 @@ async def anonadmin_command(client: Client, message: Message, verified=False, ad
 
 # --- Bio system commands ---
 async def allow_bio_user(client: Client, message: Message, verified=False):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -5503,6 +6341,15 @@ async def allow_bio_user(client: Client, message: Message, verified=False):
     await message.reply_text(f"✅ User {target.mention} whitelisted from bio/link checks.")
 
 async def unallow_bio_user(client: Client, message: Message, verified=False):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await unallow_bio_user(client, message, verified=True)
@@ -5537,6 +6384,16 @@ async def unallow_bio_user(client: Client, message: Message, verified=False):
     await message.reply_text(f"❌ User {target.mention} removed from whitelist.")
 
 async def aplist_bio(client: Client, message: Message, verified=False):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await aplist_bio(client, message, verified=True)
@@ -5570,6 +6427,15 @@ async def aplist_bio(client: Client, message: Message, verified=False):
     await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
 
 async def bioconfig_cmd(client: Client, message: Message, verified=False):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await bioconfig_cmd(client, message, verified=True)
@@ -5721,7 +6587,12 @@ async def bio_and_link_scanner(client: Client, message: Message):
             await client.send_message(chat_id, text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
 
 async def set_vc_msg(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    # Anonymous admin detection
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+# Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await set_vc_msg(client, message, verified=True, admin_id=0)
@@ -5752,6 +6623,10 @@ async def set_vc_msg(client: Client, message: Message, verified=False, admin_id:
     await message.reply_text("VC message set.")
 
 async def set_vc_invite(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -5838,6 +6713,11 @@ async def get_fed(chat_id: int) -> str | None:
     return doc["fed_id"] if doc else None
 
 async def fed_info(client: Client, message: Message, verified=False, admin_id=None):
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -6168,6 +7048,125 @@ async def resolve_user(client: Client, identifier: str):
     # Could also try by full name, but keep it simple for now
     return None
 
+async def quietfed_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        if await get_anonadmin_enabled(message.chat.id):
+            return await quietfed_cmd(client, message, verified=True, admin_id=0)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_admin_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "action": "quietfed",
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+            ]])
+            await message.reply_text(
+                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+                reply_markup=keyboard
+            )
+            return
+
+    # Admin check for normal users
+    if not verified:
+        if not await require_admin(client, message):
+            return
+
+    # Bot must be admin in group (if in group)
+    if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        if not await bot_is_admin(client, message.chat.id):
+            await message.reply_text("❌ I am not admin here.")
+            return
+
+    chat_id = message.chat.id
+    enabled = await get_quietfed_enabled(chat_id)
+
+    # Build keyboard with green dot on Enable if enabled, red dot on Disable if disabled
+    enable_text = "🟢 Enable" if enabled else "Enable"
+    disable_text = "Disable" if enabled else "🔴 Disable"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(enable_text, callback_data=f"quietfed:enable:{chat_id}"),
+            InlineKeyboardButton(disable_text, callback_data=f"quietfed:disable:{chat_id}")
+        ],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    description = (
+        "When enabled, users banned in the federation will be automatically removed "
+        "(banned/kicked) whenever they join or send a message, with an explanation."
+        if enabled else
+        "When disabled, federation-banned users will not be automatically removed."
+    )
+    await message.reply_text(
+        f"**Quiet Federation Ban Mode**\n\nCurrent status: {status}\n\n{description}",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
+async def check_and_punish_fedbanned_user(
+    client: Client,
+    chat_id: int,
+    user_id: int,
+    message: Message = None
+) -> bool:
+    """
+    Checks if the user is banned in the chat's federation.
+    If quietfed is enabled and the user is banned, they are banned from the chat,
+    their message is deleted (if any), and a notification is sent.
+    Returns True if the user was banned, False otherwise.
+    """
+    # 1. Get chat's federation
+    fed_membership = await fed_membership_col.find_one({"chat_id": chat_id})
+    if not fed_membership:
+        return False
+    fed_id = fed_membership["fed_id"]
+
+    # 2. Check if user is fedbanned
+    fed_ban = await fban_list_col.find_one({"fed_id": fed_id, "user_id": user_id})
+    if not fed_ban:
+        return False
+
+    # 3. Check if quietfed is enabled
+    if not await get_quietfed_enabled(chat_id):
+        return False
+
+    # 4. Get federation name
+    fed = await federations_col.find_one({"fed_id": fed_id})
+    fed_name = fed["fed_name"] if fed else "Unknown Federation"
+
+    # 5. Ban the user from the chat
+    try:
+        await client.ban_chat_member(chat_id, user_id)
+    except Exception as e:
+        print(f"Error banning fedbanned user {user_id}: {e}")
+        return False
+
+    # 6. Delete the user's message if provided
+    if message:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    # 7. Send notification
+    reason = fed_ban.get("reason", "No reason provided")
+    text = (
+        f"🚫 **User removed**\n"
+        f"👤 User: {message.from_user.mention if message else f'<code>{user_id}</code>'}\n"
+        f"🏛 Federation: {fed_name}\n"
+        f"📝 Reason: {reason}\n\n"
+        f"This user is banned in the federation and cannot join or speak here."
+    )
+    await client.send_message(chat_id, text, parse_mode=enums.ParseMode.MARKDOWN)
+
+    return True    
 
 async def show_user_bans(client: Client, message: Message, user_id: int, fed_id: str = None):
     """
@@ -6877,71 +7876,98 @@ async def safety_handler(client: Client, message: Message):
     if await is_admin(client, message, user_id) or await is_approved(chat_id, user_id):
         return
 
-    # Flood control
-    if await get_chat_setting(chat_id, "flood_enabled", "1") == "1":
+    # --- NEW: Check fedbanned ---
+    if await check_and_punish_fedbanned_user(client, chat_id, user_id, message):
+        return
+
+        # Flood control
+    flood_timer_enabled = await get_chat_setting(chat_id, "flood_timer_enabled", "0") == "1"
+    if flood_timer_enabled:
+        # Timer‑based flood detection
+        count = int(await get_chat_setting(chat_id, "flood_timer_count", "5"))
+        seconds = int(await get_chat_setting(chat_id, "flood_timer_seconds", "10"))
         key = (chat_id, user_id)
         now = time.time()
-        dq = flood_tracker[key]
-        dq.append(now)
-        while dq and now - dq[0] > 10:
-            dq.popleft()
-        if len(dq) >= int(await get_chat_setting(chat_id, "flood_limit", "5")):
+        # Retrieve the user's timestamp list from a separate timer tracker
+        # We'll use a new dict: flood_timer_tracker
+        timestamps = flood_timer_tracker.get(key, [])
+        # Remove timestamps older than the allowed window
+        timestamps = [ts for ts in timestamps if now - ts < seconds]
+        timestamps.append(now)
+        flood_timer_tracker[key] = timestamps
+        if len(timestamps) > count:
             mode = (await get_chat_setting(chat_id, "flood_mode", "mute")).lower()
+            duration = int(await get_chat_setting(chat_id, "flood_duration", "60"))
+            until = int(time.time()) + duration if mode in ("tban", "tmute") else None
             with suppress(Exception):
                 await message.delete()
             if mode == "ban":
                 await client.ban_chat_member(chat_id, user_id)
             elif mode == "mute":
                 await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False))
+            elif mode == "tban":
+                await client.ban_chat_member(chat_id, user_id, until_date=until)
+            elif mode == "tmute":
+                await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False), until_date=until)
             await message.stop_propagation()
             return
-
-    # Locks
-    for lk in LOCK_TYPES:
-        if await get_chat_setting(chat_id, f"lock_{lk}", "0") == "1":
-            if (
-                (lk == "link" and re.search(r'http[s]?://\S+', text))
-                or (lk == "media" and any([message.photo, message.video, message.document]))
-                or (lk == "sticker" and message.sticker)
-                or (lk == "gif" and message.animation)
-                or (lk == "voice" and message.voice)
-                or (lk == "poll" and message.poll)
-                or (lk == "text" and (message.text or message.caption))
-                or (lk == "emoji" and (message.text or message.caption) and has_emoji(text))
-            ):
+    else:
+        # Original consecutive flood detection
+        if await get_chat_setting(chat_id, "flood_enabled", "1") == "1":
+            key = (chat_id, user_id)
+            now = time.time()
+            dq = flood_tracker[key]
+            dq.append(now)
+            while dq and now - dq[0] > FLOOD_WINDOW:
+                dq.popleft()
+            if len(dq) >= int(await get_chat_setting(chat_id, "flood_limit", "5")):
+                mode = (await get_chat_setting(chat_id, "flood_mode", "mute")).lower()
                 with suppress(Exception):
                     await message.delete()
+                if mode == "ban":
+                    await client.ban_chat_member(chat_id, user_id)
+                elif mode == "mute":
+                    await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False))
                 await message.stop_propagation()
                 return
-
+            
 async def pin_event_handler(client: Client, message: Message):
-    # This message is a service message about a pin
     pinned = message.pinned_message
     if not pinned:
-        return  # unpin event – ignore
+        return
     chat_id = message.chat.id
 
-    # If the pinned message is from a channel
+    # If the pinned message is from a channel (anonymous admin or linked channel)
     if pinned.sender_chat:
         if await get_antichannel_enabled(chat_id):
+            # First try to restore the permanent pin
+            permapin_id = await get_chat_setting(chat_id, "permapin_id", "0")
+            if permapin_id != "0":
+                permapin_id = int(permapin_id)
+                try:
+                    # Check if the permapin message still exists
+                    await client.get_messages(chat_id, permapin_id)
+                    # Unpin the channel message and restore the permapin
+                    await client.unpin_chat_message(chat_id, pinned.id)
+                    await client.pin_chat_message(chat_id, permapin_id, disable_notification=True)
+                    return
+                except Exception:
+                    # permapin message no longer exists – clear the setting
+                    await set_chat_setting(chat_id, "permapin_id", "0")
+            # Fallback to the last manually pinned message
             last_pin_id = await get_last_manual_pin(chat_id)
             if last_pin_id:
                 try:
-                    # Check if last manual pin still exists
                     await client.get_messages(chat_id, last_pin_id)
-                    # Unpin the channel pin
                     await client.unpin_chat_message(chat_id, pinned.id)
-                    # Restore the last manual pin
                     await client.pin_chat_message(chat_id, last_pin_id, disable_notification=True)
                 except Exception:
-                    # Last pin missing – just unpin the channel pin
                     await client.unpin_chat_message(chat_id, pinned.id)
-                    await set_last_manual_pin(chat_id, 0)  # clear
+                    await set_last_manual_pin(chat_id, 0)
             else:
-                # No previous manual pin – just unpin
                 await client.unpin_chat_message(chat_id, pinned.id)
     else:
-        # Manual pin from a user – update the last manual pin
+        # Manual pin from a user – update the last manual pin (does not affect permapin)
         await set_last_manual_pin(chat_id, pinned.id)
 
 async def cleanlinked_handler(client: Client, message: Message):
@@ -6970,6 +7996,11 @@ async def clean_cmd_toggle(client: Client, message: Message, verified=False, adm
     await generic_toggle(client, message, "clean_cmd_enabled", "cleancommands", verified, admin_id)
 
 async def clean_cmd_for(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -7023,6 +8054,16 @@ async def clean_cmd_handler(client: Client, message: Message) -> None:
         await message.delete()
 
 async def reload_bot(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -7052,6 +8093,7 @@ async def reload_bot(client: Client, message: Message, verified=False, admin_id:
 
     flood_tracker.clear()
     active_users.clear()
+    flood_timer_tracker.clear()
     await message.reply_text("Reloaded runtime caches.")
 
 async def language(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
@@ -7082,6 +8124,11 @@ async def language(client: Client, message: Message, verified=False, admin_id: i
         if not await require_admin(client, message):
             return
 
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     args = get_args(message)
     if not args or args[0].lower() not in {"en", "hi"}:
         await message.reply_text("Usage: /language en|hi")
@@ -7090,6 +8137,11 @@ async def language(client: Client, message: Message, verified=False, admin_id: i
     await message.reply_text("Language updated.")
 
 async def disable_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -7130,6 +8182,16 @@ async def disable_cmd(client: Client, message: Message, verified=False, admin_id
     await message.reply_text(f"Disabled /{cmd}")
 
 async def enable_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -7166,6 +8228,15 @@ async def enable_cmd(client: Client, message: Message, verified=False, admin_id:
     await message.reply_text(f"Enabled /{cmd}")
 
 async def disabled_cmds(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
     cursor = disabled_commands_col.find({"chat_id": message.chat.id})
     docs = await cursor.to_list(length=1000)
     cmds = [doc["command"] for doc in docs]
@@ -7186,6 +8257,15 @@ async def disabled_cmd_guard(client: Client, message: Message) -> None:
         message.stop_propagation()
 
 async def antiraid(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -7230,6 +8310,11 @@ async def connection(client: Client, message: Message) -> None:
 # export_data, import_data, ddata, deldata removed as per json removal requirement.
 
 async def set_log_channel(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
@@ -7271,7 +8356,18 @@ async def mics(client: Client, message: Message, verified=False, admin_id: int =
     await generic_toggle(client, message, "mics_enabled", "mics", verified, admin_id)
     
 # --- Tagging commands ---
+
 async def canceltag(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     if not await require_admin(client, message):
         return
     chat_id = message.chat.id
@@ -7284,6 +8380,15 @@ async def canceltag(client: Client, message: Message) -> None:
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 async def utag(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
     # check if anonymous / enormous admin
     if message.sender_chat:
         # Check if anonymous admin mode is enabled
@@ -7357,6 +8462,16 @@ async def _utag_main(client: Client, message: Message):
 
 
 async def atag(client: Client, message: Message) -> None:
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+    
+    # --- NEW: Bot must be admin and have restrict members permission ---
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+
     # check if anonymous / enormous admin
     if message.sender_chat:
         # Check if anonymous admin mode is enabled
@@ -8415,15 +9530,6 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
     elif command == "cleanservice":
         await cleanservice(client, msg, verified=True, admin_id=callback_query.from_user.id)
     
-    elif command == "flood":
-        await flood_toggle(client, msg, verified=True, admin_id=callback_query.from_user.id)
-    
-    elif command == "setflood":
-        await setflood(client, msg, verified=True, admin_id=callback_query.from_user.id)
-    
-    elif command == "setfloodmode":
-        await setfloodmode(client, msg, verified=True, admin_id=callback_query.from_user.id)
-    
     elif command == "clearflood":
         await clearflood(client, msg, verified=True, admin_id=callback_query.from_user.id)
     
@@ -8447,6 +9553,18 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
 
     elif command == "fedstat":
         await fedstat_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "quietfed":
+        await quietfed_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "floodcontrol":
+        await floodcontrol_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "setfloodmode":
+        await setfloodmode_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "setfloodtimer":
+        await setfloodtimer_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     del pending_admin_actions[action_id]
 
@@ -8680,6 +9798,265 @@ async def anonadmin_callback(client: Client, callback_query: CallbackQuery):
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
+async def quietfed_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "quietfed":
+        return
+    action = parts[1]
+    chat_id = int(parts[2])
+    user_id = callback_query.from_user.id
+
+    # Verify admin
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        if member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            await callback_query.answer("❌ You are not an admin!", show_alert=True)
+            return
+    except Exception:
+        await callback_query.answer("❌ Failed to verify admin status.", show_alert=True)
+        return
+
+    if action == "enable":
+        await set_quietfed_enabled(chat_id, True)
+        await callback_query.answer("✅ Quiet federation ban mode enabled.", show_alert=False)
+    elif action == "disable":
+        await set_quietfed_enabled(chat_id, False)
+        await callback_query.answer("❌ Quiet federation ban mode disabled.", show_alert=False)
+
+    # Refresh message
+    enabled = await get_quietfed_enabled(chat_id)
+    enable_text = "🟢 Enable" if enabled else "Enable"
+    disable_text = "Disable" if enabled else "🔴 Disable"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(enable_text, callback_data=f"quietfed:enable:{chat_id}"),
+            InlineKeyboardButton(disable_text, callback_data=f"quietfed:disable:{chat_id}")
+        ],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    description = (
+        "When enabled, users banned in the federation will be automatically removed "
+        "(banned/kicked) whenever they join or send a message, with an explanation."
+        if enabled else
+        "When disabled, federation-banned users will not be automatically removed."
+    )
+    await callback_query.edit_message_text(
+        f"**Quiet Federation Ban Mode**\n\nCurrent status: {status}\n\n{description}",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
+async def floodcontrol_callback(client: Client, callback_query: CallbackQuery):
+    q = callback_query
+    await q.answer()
+    if not await is_admin(client, q.message, q.from_user.id):
+        await q.edit_message_text("❌ Admin only.")
+        return
+
+    data = q.data
+    chat_id = q.message.chat.id
+
+    if data == "flood_enable":
+        # Enable flood control: decide which mode to use
+        timer_configured = await get_chat_setting(chat_id, "flood_timer_count", "0") != "0"
+        if timer_configured:
+            await set_chat_setting(chat_id, "flood_timer_enabled", "1")
+            await set_chat_setting(chat_id, "flood_enabled", "0")
+            msg = "✅ Flood control enabled (Timer Mode)."
+        else:
+            await set_chat_setting(chat_id, "flood_enabled", "1")
+            await set_chat_setting(chat_id, "flood_timer_enabled", "0")
+            msg = "✅ Flood control enabled (Consecutive Mode)."
+    elif data == "flood_disable":
+        await set_chat_setting(chat_id, "flood_enabled", "0")
+        await set_chat_setting(chat_id, "flood_timer_enabled", "0")
+        msg = "❌ Flood control disabled."
+    elif data == "flood_refresh":
+        msg = "🔄 Refreshed."
+    else:
+        return
+
+    enabled = await is_flood_enabled(chat_id)
+    mode, params = await get_flood_mode(chat_id)
+
+    if enabled:
+        if mode == "timer":
+            status_text = (
+                f"🟢 Flood control is **enabled** in {q.message.chat.title} (Timer Mode)\n"
+                f"Users sending **{params['count']}** or more messages within **{params['seconds']}** seconds will be punished.\n"
+                f"Current action: {await get_chat_setting(chat_id, 'flood_mode', 'mute')}"
+            )
+        else:
+            status_text = (
+                f"🟢 Flood control is **enabled** in {q.message.chat.title} (Consecutive Mode)\n"
+                f"Users sending **{params['limit']}** or more consecutive messages within **{params['window']}** seconds will be punished.\n"
+                f"Current action: {await get_chat_setting(chat_id, 'flood_mode', 'mute')}"
+            )
+    else:
+        status_text = (
+            f"🔴 Flood control is **disabled** in {q.message.chat.title}.\n"
+            "This chat is not currently enforcing flood control."
+        )
+
+    keyboard = get_floodcontrol_keyboard(enabled)
+    try:
+        await q.edit_message_text(f"{msg}\n\n{status_text}", reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+    except MessageNotModified:
+        pass
+
+async def setfloodmode_action_callback(client: Client, callback_query: CallbackQuery):
+    q = callback_query
+    data = q.data
+    action = data.split(":")[1]
+    chat_id = q.message.chat.id
+    user_id = q.from_user.id
+
+    if not await is_admin(client, q.message, user_id):
+        await q.answer("❌ You are not an admin!", show_alert=True)
+        return
+
+    if action in ("tban", "tmute"):
+        session_id = str(uuid.uuid4())
+        pending_floodmode[session_id] = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "action": action,
+            "duration_min_str": "",     # store the minutes string
+            "message_id": q.message.id,
+            "chat_id_for_edit": chat_id
+        }
+        text = f"**Selected action:** {action.upper()}\n\nEnter duration in **minutes**:\n\nCurrent: 0"
+        keyboard = build_number_pad("")
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+    else:
+        await set_chat_setting(chat_id, "flood_mode", action)
+        await set_chat_setting(chat_id, "flood_duration", "0")
+        await q.edit_message_text(f"✅ Flood mode set to **{action.upper()}**.")
+        await q.answer(f"Mode set to {action}", show_alert=False)
+
+async def setfloodmode_duration_callback(client: Client, callback_query: CallbackQuery):
+    q = callback_query
+    data = q.data
+    user_id = q.from_user.id
+
+    session = None
+    session_id = None
+    for sid, s in pending_floodmode.items():
+        if s["user_id"] == user_id and s["chat_id"] == q.message.chat.id:
+            session = s
+            session_id = sid
+            break
+
+    if not session:
+        await q.answer("Session expired. Please run /setfloodmode again.", show_alert=True)
+        return
+
+    if not await is_admin(client, q.message, user_id):
+        await q.answer("❌ You are not an admin!", show_alert=True)
+        return
+
+    if data.startswith("floodmode_digit:"):
+        digit = data.split(":")[1]
+        session["duration_min_str"] += digit
+        text = f"**Selected action:** {session['action'].upper()}\n\nEnter duration in **minutes**:\n\nCurrent: {session['duration_min_str']}"
+        keyboard = build_number_pad(session["duration_min_str"])
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+
+    elif data == "floodmode_clear":
+        session["duration_min_str"] = ""
+        text = f"**Selected action:** {session['action'].upper()}\n\nEnter duration in **minutes**:\n\nCurrent: 0"
+        keyboard = build_number_pad("")
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+
+    elif data == "floodmode_back":
+        del pending_floodmode[session_id]
+        # Re‑render the action selection menu (convert stored seconds to minutes)
+        current_action = await get_chat_setting(session["chat_id"], "flood_mode", "mute")
+        current_duration_sec = int(await get_chat_setting(session["chat_id"], "flood_duration", "60"))
+        current_duration_min = current_duration_sec // 60
+        actions = [
+            ("mute", "🔇 Mute"),
+            ("ban", "🚫 Ban"),
+            ("kick", "👢 Kick"),
+            ("tban", "⏱️ Tban"),
+            ("tmute", "⏱️ Tmute")
+        ]
+        keyboard = []
+        row = []
+        for a, label in actions:
+            display = f"✅ {label}" if a == current_action else label
+            row.append(InlineKeyboardButton(display, callback_data=f"setfloodmode_action:{a}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("🗑 Close", callback_data="del_msg")])
+        text = (f"**Current flood mode:** {current_action.upper()}\n"
+                f"**Duration (for tban/tmute):** {current_duration_min} minute(s)\n\n"
+                f"Select new flood action:")
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+
+    elif data == "floodmode_ok":
+        minutes_str = session["duration_min_str"]
+        if not minutes_str or int(minutes_str) == 0:
+            await q.answer("Please enter a valid duration (positive number of minutes).", show_alert=True)
+            return
+        minutes = int(minutes_str)
+        seconds = minutes * 60
+        await set_chat_setting(session["chat_id"], "flood_mode", session["action"])
+        await set_chat_setting(session["chat_id"], "flood_duration", str(seconds))
+        await q.edit_message_text(f"✅ Flood mode set to **{session['action'].upper()}** with duration **{minutes} minute(s)**.")
+        await q.answer(f"Mode set to {session['action']} with {minutes} minute(s)", show_alert=False)
+        del pending_floodmode[session_id]
+
+    else:
+        await q.answer("Invalid action.", show_alert=True)
+
+async def clearflood_callback(client: Client, callback_query: CallbackQuery):
+    q = callback_query
+    await q.answer()
+    if not await is_admin(client, q.message, q.from_user.id):
+        await q.edit_message_text("❌ Admin only.")
+        return
+
+    data = q.data
+    chat_id = q.message.chat.id
+    action = data.split(":")[1]
+
+    if action == "enable":
+        await set_chat_setting(chat_id, "clear_flood_enabled", "1")
+        msg = "✅ Clearflood enabled."
+    elif action == "disable":
+        await set_chat_setting(chat_id, "clear_flood_enabled", "0")
+        msg = "❌ Clearflood disabled."
+    elif action == "refresh":
+        msg = "🔄 Refreshed."
+    else:
+        return
+
+    enabled = await get_chat_setting(chat_id, "clear_flood_enabled", "1") == "1"
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    description = (
+        f"Antiflood clearing is currently **{status}** in {q.message.chat.title}. "
+        "When someone floods, all their flood messages will be automatically deleted."
+        if enabled else
+        f"Antiflood clearing is currently **{status}** in {q.message.chat.title}. "
+        "When someone floods, their flood messages will NOT be automatically deleted."
+    )
+
+    keyboard = get_clearflood_keyboard(enabled)
+    try:
+        await q.edit_message_text(f"{msg}\n\n{description}", reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+    except MessageNotModified:
+        pass
+
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
@@ -8691,19 +10068,19 @@ def main():
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
         "welcome": welcome_toggle, "setgoodbye": setgoodbye, "resetgoodbye": resetgoodbye,
         "goodbye": goodbye_toggle, "setrules": setrules, "rules": rules, "setnote": setnote,
-        "get": get_note, "delnote": delnote, "warn": warn, "dwarn": dwarn, "warns": warnings, "warnings": warnsettings, "warnconfig": warnsettings, "swarn": swarn,
+        "get": get_note, "delnote": delnote, "warn": warn, "dwarn": dwarn, "warnings": warnings, "warnsettings": warnsettings, "warnconfig": warnsettings, "swarn": swarn,
         "resetwarns": resetwarns, "unwarn": unwarn, "warnmode": warnmode_cmd, "warninfo": warninfo_cmd,  "resetallwarns": resetallwarns, "warntime": warntime_cmd,
         "mute": mute, "dmute": dmute, "smute": smute, "tmute": tmute, "rmwarn": unwarn, "resetwarn": resetwarns,
         "unmute": unmute, "ban": ban, "sban": sban, "tban": tban, "dban": dban, "unban": unban,
         "kick": kick, "dkick": dkick, "skick": skick, "kickme": kickme, "lock": lock, "unlock": unlock,
         "pin": pin_message, "unpin": unpin_message, "cleanservice": cleanservice, "cleancommands": clean_cmd_toggle,
-        "cleanfor": clean_cmd_for, "captcha": captcha_toggle, "flood": flood_toggle, "setflood": setflood,
-        "setfloodmode": setfloodmode, "clearflood": clearflood, "approve": approve, "unapprove": unapprove,"unapproveall": unapproveall,
+        "cleanfor": clean_cmd_for, "captcha": captcha_toggle, "floodcontrol": floodcontrol_cmd, "setfloodtimer": setfloodtimer_cmd,
+        "setfloodmode": setfloodmode_cmd, "clearflood": clearflood, "approve": approve, "unapprove": unapprove,"unapproveall": unapproveall,
         "approved": approved, "approval": approval,"adminlist": adminlist, "promote": promote, "demote": demote,
         "setgtitle": setgtitle, "resetgtitle": resetgtitle, "setgpic": setgpic, "delgpic": delgpic, "setgdesc": setgdesc, "delgdesc": delgdesc,
         "admincache": admincache, "id": id_cmd, "info": info, "purge": purge, "report": report,
         "admins": admins_cmd, "del": del_message, "pinned": pinned_cmd, "spin": spin_message, "unpinall": unpinall_message, "permapin": permapin_command,
-        "formatting": formatting, "fpromote": federation_admin_manager, "fdemote": federation_admin_manager,"leavefed" :leavefed_cmd, "chatfed": chatfed_cmd,
+        "formatting": formatting, "fpromote": federation_admin_manager, "fdemote": federation_admin_manager,"leavefed" :leavefed_cmd, "chatfed": chatfed_cmd, "quietfed": quietfed_cmd,
         "setvcmsg": set_vc_msg, "vcmsg": vcmsg_toggle, "setvcinvite": set_vc_invite, "vcinvite": vcinvite_toggle, "fedadmins": fedadmins_cmd, "fedstat": fedstat_cmd,
         "newfed": new_fed, "subfed": subscribe_fed, "unsubfed": unsubscribe_fed,  "joinfed": join_fed_group, "fedinfo": fed_info, "delfed": del_fed, "fban": fban_user,
         "unfban": unfban_user, "utag": utag, "atag": atag, "cancel": canceltag, "spurge": spurge,
@@ -8755,6 +10132,11 @@ def main():
     app.add_handler(CallbackQueryHandler(unapproveall_callback, filters.regex(r"^unapproveall:")))
     app.add_handler(CallbackQueryHandler(join_fed_callback, filters.regex(r"^joinfed:")))
     app.add_handler(CallbackQueryHandler(leavefed_callback, filters.regex(r"^leavefed:")))
+    app.add_handler(CallbackQueryHandler(quietfed_callback, filters.regex(r"^quietfed:")))
+    app.add_handler(CallbackQueryHandler(floodcontrol_callback, filters.regex(r"^flood_")))
+    app.add_handler(CallbackQueryHandler(setfloodmode_action_callback, filters.regex(r"^setfloodmode_action:")))
+    app.add_handler(CallbackQueryHandler(setfloodmode_duration_callback, filters.regex(r"^floodmode_")))
+    app.add_handler(CallbackQueryHandler(clearflood_callback, filters.regex(r"^clearflood:")))
 
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
