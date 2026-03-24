@@ -6,6 +6,13 @@ import uuid
 from collections import defaultdict, deque
 from contextlib import suppress
 from datetime import datetime, timedelta
+# Fix for Pyrogram on Python 3.14+ (no event loop in main thread)
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+# -------------------------
+
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from html import escape
