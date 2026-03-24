@@ -59,7 +59,7 @@ federations_col = mongo_db["federations"]
 fban_list_col = mongo_db["fban_list"]
 bio_config_col = mongo_db["bio_config"]
 bio_allowlist_col = mongo_db["bio_allowlist"]
-bio_warnings_col = mongo_db["bio_warnings"]
+bio_warns_col = mongo_db["bio_warns"]
 system_info_col = mongo_db["system_info"]
 permapin_messages_col = mongo_db["permapin_messages"]
 
@@ -154,7 +154,7 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "reports": ("🚨 REPORTS", "/report"),
     "rules": ("📜 RULES", "/setrules /rules"),
     "topic": ("🧵 TOPIC", "Topic tools placeholder (extend as needed)."),
-    "warning": ("⚠️ WARNING", "/warn /dwarn /warnings /resetwarns /unwarn"),
+    "warning": ("⚠️ WARNING", "/warn /dwarn /warns /resetwarns /unwarn"),
     "silent": ("🤫 SILENT POWER", "/smute /sban /skick /dmute /dwarn"),
     "importexport": ("📤 IMPORT/EXPORT", "/exportdata /importdata <json>"),
     "mics": ("🎙 MICS", "/mics on|off"),
@@ -453,12 +453,12 @@ async def delete_verify_button(msg):
     except:
         pass
 
-async def expire_warnings_loop():
-    """Periodically remove warnings older than the chat's warn_expiry setting."""
+async def expire_warns_loop():
+    """Periodically remove warns older than the chat's warn_expiry setting."""
     while True:
         try:
-            print("[Expiry] Checking for expired warnings...")
-            # Get all unique chat IDs that have any warnings
+            print("[Expiry] Checking for expired warns...")
+            # Get all unique chat IDs that have any warns
             pipeline = [{"$group": {"_id": "$chat_id"}}]
             chat_ids_cursor = warns_col.aggregate(pipeline)
             chat_ids = [doc["_id"] async for doc in chat_ids_cursor]
@@ -470,16 +470,16 @@ async def expire_warnings_loop():
                     continue
                 cutoff = int(time.time()) - expiry
 
-                # Remove expired warnings from all users in this chat
+                # Remove expired warns from all users in this chat
                 result = await warns_col.update_many(
                     {"chat_id": chat_id},
-                    {"$pull": {"warnings": {"time": {"$lt": cutoff}}}}
+                    {"$pull": {"warns": {"time": {"$lt": cutoff}}}}
                 )
                 if result.modified_count:
-                    print(f"[Expiry] Removed expired warnings for {result.modified_count} users in chat {chat_id}")
+                    print(f"[Expiry] Removed expired warns for {result.modified_count} users in chat {chat_id}")
 
-                # Delete user documents that now have an empty warnings array
-                deleted = await warns_col.delete_many({"chat_id": chat_id, "warnings": {"$size": 0}})
+                # Delete user documents that now have an empty warns array
+                deleted = await warns_col.delete_many({"chat_id": chat_id, "warns": {"$size": 0}})
                 if deleted.deleted_count:
                     print(f"[Expiry] Deleted {deleted.deleted_count} empty warning records in chat {chat_id}")
 
@@ -1706,13 +1706,13 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
     # Update database: push warning
     await warns_col.update_one(
         {"chat_id": chat_id, "user_id": uid},
-        {"$push": {"warnings": warning}},
+        {"$push": {"warns": warning}},
         upsert=True
     )
 
     # Fetch updated document to get count
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": uid})
-    cnt = len(doc.get("warnings", []))
+    cnt = len(doc.get("warns", []))
     limit = int(await get_chat_setting(chat_id, "warn_limit", "3"))
 
     if cnt >= limit:
@@ -1744,7 +1744,7 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
             await message.reply_text(f"Failed to apply {action}: {e}")
             return
 
-        # Delete all warnings after punishment
+        # Delete all warns after punishment
         await warns_col.delete_one({"chat_id": chat_id, "user_id": uid})
 
         if not silent:
@@ -1778,7 +1778,7 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
         with suppress(Exception):
             await message.delete()
             
-async def warnsettings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+async def warnings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
@@ -1791,13 +1791,13 @@ async def warnsettings(client: Client, message: Message, verified=False, admin_i
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
-            return await warnsettings(client, message, verified=True, admin_id=0)
+            return await warnings(client, message, verified=True, admin_id=0)
         else:
             action_id = str(uuid.uuid4())
             pending_admin_actions[action_id] = {
                 "chat_id": message.chat.id,
                 "message": message,
-                "action": "warnsettings",
+                "action": "warnings",
                 "time": time.time(),
                 "used": False
             }
@@ -1860,7 +1860,7 @@ async def warntime_cmd(client: Client, message: Message, verified=False, admin_i
     if not args:
         current = await get_chat_setting(message.chat.id, "warn_expiry", "0")
         if current == "0":
-            text = "No expiry (warnings last forever)"
+            text = "No expiry (warns last forever)"
         else:
             text = f"{current} seconds"
         return await message.reply_text(f"Current warning expiry: {text}")
@@ -2003,7 +2003,7 @@ async def resetallwarns(client: Client, message: Message, verified=False, admin_
     try:
         member = await client.get_chat_member(message.chat.id, user_id)
         if member.status != enums.ChatMemberStatus.OWNER:
-            await message.reply_text("❌ Only the group owner can reset all warnings.")
+            await message.reply_text("❌ Only the group owner can reset all warns.")
             return
     except Exception:
         await message.reply_text("❌ Could not verify owner status.")
@@ -2013,12 +2013,12 @@ async def resetallwarns(client: Client, message: Message, verified=False, admin_
     chat_title = message.chat.title or "this group"
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚠️ Reset All Warnings", callback_data=f"resetall:confirm:{chat_id}")],
+        [InlineKeyboardButton("⚠️ Reset All warns", callback_data=f"resetall:confirm:{chat_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"resetall:cancel:{chat_id}")]
     ])
 
     await message.reply_text(
-        f"⚠️ **Are you sure?**\n\nThis will reset **all warnings** for every member in {chat_title}.",
+        f"⚠️ **Are you sure?**\n\nThis will reset **all warns** for every member in {chat_title}.",
         reply_markup=keyboard,
         parse_mode=enums.ParseMode.MARKDOWN
     )
@@ -2089,12 +2089,12 @@ async def resetwarns(client: Client, message: Message, verified=False, admin_id:
     uid = target.id
 
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": uid})
-    if not doc or not doc.get("warnings"):
-        await message.reply_text("⚠️ This user has no warnings.")
+    if not doc or not doc.get("warns"):
+        await message.reply_text("⚠️ This user has no warns.")
         return
 
     await warns_col.delete_one({"chat_id": chat_id, "user_id": uid})
-    await message.reply_text(f"✅ All warnings reset for {target.mention}.")    
+    await message.reply_text(f"✅ All warns reset for {target.mention}.")    
 
 async def warninfo_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
@@ -2153,7 +2153,7 @@ async def warninfo_cmd(client: Client, message: Message, verified=False, admin_i
 
     # Get warn count
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": uid})
-    warn_count = len(doc.get("warnings", [])) if doc else 0
+    warn_count = len(doc.get("warns", [])) if doc else 0
     limit = int(await get_chat_setting(chat_id, "warn_limit", "3"))
 
     # Get member status
@@ -2196,7 +2196,7 @@ async def warninfo_cmd(client: Client, message: Message, verified=False, admin_i
 
     text = (
         f"**Warn Info for {user_info}**\n"
-        f"• Warnings: {warn_count}/{limit}\n"
+        f"• warns: {warn_count}/{limit}\n"
         f"• Status: {status_text}"
     )
     await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)        
@@ -2362,7 +2362,7 @@ async def swarn(client: Client, message: Message) -> None:
 
     await warn_common(client, message, delete_cmd=True, silent=True, delete_replied=False)
 
-async def warnings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+async def warns(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
@@ -2375,13 +2375,13 @@ async def warnings(client: Client, message: Message, verified=False, admin_id: i
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
-            return await warnings(client, message, verified=True, admin_id=0)
+            return await warns(client, message, verified=True, admin_id=0)
         else:
             action_id = str(uuid.uuid4())
             pending_admin_actions[action_id] = {
                 "chat_id": message.chat.id,
                 "message": message,
-                "action": "warnings",
+                "action": "warns",
                 "time": time.time(),
                 "used": False
             }
@@ -2411,12 +2411,12 @@ async def warnings(client: Client, message: Message, verified=False, admin_id: i
     chat_id = message.chat.id
 
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": uid})
-    if not doc or not doc.get("warnings"):
+    if not doc or not doc.get("warns"):
         cnt = 0
-        warnings_list = []
+        warns_list = []
     else:
-        warnings_list = doc["warnings"]
-        cnt = len(warnings_list)
+        warns_list = doc["warns"]
+        cnt = len(warns_list)
 
     limit = await get_warn_limit(chat_id)
     action = await get_warn_action(chat_id)
@@ -2430,17 +2430,17 @@ async def warnings(client: Client, message: Message, verified=False, admin_id: i
     else:
         user_string = f"{full_name} (ID: {uid})"
 
-    text = f"⚠️ **Warnings for {user_string}**\n\n"
-    text += f"**Current warnings:** {cnt}/{limit}\n"
+    text = f"⚠️ **warns for {user_string}**\n\n"
+    text += f"**Current warns:** {cnt}/{limit}\n"
     text += f"**Action on reaching limit:** `{action.upper()}`\n\n"
 
-    if warnings_list:
-        text += "**List of warnings:**\n"
-        for i, w in enumerate(warnings_list, 1):
+    if warns_list:
+        text += "**List of warns:**\n"
+        for i, w in enumerate(warns_list, 1):
             reason = w.get("reason", "No reason")
             text += f"{i}. {reason}\n"
     else:
-        text += "No warnings recorded."
+        text += "No warns recorded."
 
     await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -2469,13 +2469,13 @@ async def unwarn(client: Client, message: Message, verified=False, admin_id: int
     chat_id = message.chat.id
 
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": uid})
-    if not doc or not doc.get("warnings"):
-        await message.reply_text("This user has no warnings.")
+    if not doc or not doc.get("warns"):
+        await message.reply_text("This user has no warns.")
         return
 
     await warns_col.update_one(
         {"chat_id": chat_id, "user_id": uid},
-        {"$pop": {"warnings": 1}}
+        {"$pop": {"warns": 1}}
     )
 
     await message.reply_text(f"✅ Latest warning removed from {target.mention}.")
@@ -6337,7 +6337,7 @@ async def allow_bio_user(client: Client, message: Message, verified=False):
         {"$set": {"user_id": target.id}},
         upsert=True
     )
-    await bio_warnings_col.delete_one({"chat_id": message.chat.id, "user_id": target.id})
+    await bio_warns_col.delete_one({"chat_id": message.chat.id, "user_id": target.id})
     await message.reply_text(f"✅ User {target.mention} whitelisted from bio/link checks.")
 
 async def unallow_bio_user(client: Client, message: Message, verified=False):
@@ -6535,7 +6535,7 @@ async def bio_and_link_scanner(client: Client, message: Message):
         with suppress(Exception):
             await message.delete()
 
-        warn_doc = await bio_warnings_col.find_one_and_update(
+        warn_doc = await bio_warns_col.find_one_and_update(
             {"chat_id": chat_id, "user_id": user_id},
             {"$inc": {"count": 1}},
             upsert=True,
@@ -6576,7 +6576,7 @@ async def bio_and_link_scanner(client: Client, message: Message):
                 f"👤 <b>User:</b> {mention}\n"
                 f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
                 f"📝 <b>Reason:</b> {reason}\n"
-                f"📊 <b>Warnings:</b> {count}/{warn_limit}\n\n"
+                f"📊 <b>warns:</b> {count}/{warn_limit}\n\n"
                 f"🛑 <i>Notice: Please remove any links from your Bio or messages.</i>\n\n"
                 f"📌 REPEATED VIOLATIONS WILL LEAD TO MUTE/BAN."
             )
@@ -8812,11 +8812,11 @@ async def bio_callbacks_handler(client: Client, query: CallbackQuery):
 
         if b_action == "allow":
             await bio_allowlist_col.update_one({"user_id": target_id}, {"$set": {"user_id": target_id}}, upsert=True)
-            await bio_warnings_col.delete_one({"chat_id": chat_id, "user_id": target_id})
+            await bio_warns_col.delete_one({"chat_id": chat_id, "user_id": target_id})
             await query.edit_message_text(f"✅ User `{target_id}` allowed.")
 
         elif b_action == "unwarn":
-            await bio_warnings_col.update_one({"chat_id": chat_id, "user_id": target_id}, {"$inc": {"count": -1}})
+            await bio_warns_col.update_one({"chat_id": chat_id, "user_id": target_id}, {"$inc": {"count": -1}})
             await query.answer("🛡 Warning cleared!")
             with suppress(Exception):
                 await query.message.delete()
@@ -8832,13 +8832,13 @@ async def bio_callbacks_handler(client: Client, query: CallbackQuery):
                         can_add_web_page_previews=True
                     )
                 )
-            await bio_warnings_col.delete_one({"chat_id": chat_id, "user_id": target_id})
+            await bio_warns_col.delete_one({"chat_id": chat_id, "user_id": target_id})
             await query.edit_message_text(f"🔊 User `{target_id}` Unmuted.")
 
         elif b_action == "unban":
             with suppress(Exception):
                 await client.unban_chat_member(chat_id, target_id)
-            await bio_warnings_col.delete_one({"chat_id": chat_id, "user_id": target_id})
+            await bio_warns_col.delete_one({"chat_id": chat_id, "user_id": target_id})
             await query.edit_message_text(f"🔓 User `{target_id}` Unbanned.")
 
 async def warnmode_callback(client: Client, callback_query: CallbackQuery):
@@ -8964,7 +8964,7 @@ async def remove_warn_callback(client: Client, callback_query: CallbackQuery):
     try:
         member = await client.get_chat_member(chat_id, q.from_user.id)
         if member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-            await q.answer("Only admins can remove warnings!", show_alert=True)
+            await q.answer("Only admins can remove warns!", show_alert=True)
             return
     except Exception:
         await q.answer("Failed to verify admin status.", show_alert=True)
@@ -8973,7 +8973,7 @@ async def remove_warn_callback(client: Client, callback_query: CallbackQuery):
     # --- Permission check: require ban rights (can_restrict_members) ---
     if member.status != enums.ChatMemberStatus.OWNER:
         if not (member.privileges and member.privileges.can_restrict_members):
-            await q.answer("❌ You need ban rights to remove warnings.", show_alert=True)
+            await q.answer("❌ You need ban rights to remove warns.", show_alert=True)
             return
 
     # --- Get target user info (for message) ---
@@ -8985,21 +8985,21 @@ async def remove_warn_callback(client: Client, callback_query: CallbackQuery):
 
     admin_mention = q.from_user.mention
 
-    # --- Get current warnings array ---
+    # --- Get current warns array ---
     doc = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
-    if not doc or not doc.get("warnings"):
-        await q.answer("This user has no warnings.", show_alert=True)
+    if not doc or not doc.get("warns"):
+        await q.answer("This user has no warns.", show_alert=True)
         return
 
     # Pop the last warning
     await warns_col.update_one(
         {"chat_id": chat_id, "user_id": user_id},
-        {"$pop": {"warnings": 1}}
+        {"$pop": {"warns": 1}}
     )
 
     # If array becomes empty, delete the document
     remaining = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
-    if remaining and not remaining.get("warnings"):
+    if remaining and not remaining.get("warns"):
         await warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
 
     await q.answer("✅ Warning removed!", show_alert=False)
@@ -9032,7 +9032,7 @@ async def resetall_callback(client: Client, callback_query: CallbackQuery):
     try:
         member = await client.get_chat_member(chat_id, q.from_user.id)
         if member.status != enums.ChatMemberStatus.OWNER:
-            await q.answer("❌ Only the group owner can reset all warnings.", show_alert=True)
+            await q.answer("❌ Only the group owner can reset all warns.", show_alert=True)
             return
     except Exception:
         await q.answer("❌ Could not verify owner status.", show_alert=True)
@@ -9046,8 +9046,8 @@ async def resetall_callback(client: Client, callback_query: CallbackQuery):
     if action == "confirm":
         result = await warns_col.delete_many({"chat_id": chat_id})
         deleted_count = result.deleted_count
-        await q.edit_message_text(f"✅ All warnings reset for this group.\nDeleted {deleted_count} warning records.")
-        await q.answer("✅ All warnings cleared!", show_alert=False)
+        await q.edit_message_text(f"✅ All warns reset for this group.\nDeleted {deleted_count} warning records.")
+        await q.answer("✅ All warns cleared!", show_alert=False)
 
 async def prove_warn_callback(client: Client, callback_query: CallbackQuery):
 
@@ -9257,7 +9257,7 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
 
     elif command == "resetallwarns":
         if member.status != enums.ChatMemberStatus.OWNER:
-            return await callback_query.answer("❌ Only the group owner can reset all warnings.", show_alert=True)
+            return await callback_query.answer("❌ Only the group owner can reset all warns.", show_alert=True)
 
     elif command in ["warnmode", "warntime"]:
         if not await user_has_permission(client, chat_id, admin_id, "can_change_info"):
@@ -9294,8 +9294,8 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
         admin_id=callback_query.from_user.id
     )
 
-    elif command == "warnsettings":
-        await warnsettings(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    elif command == "warnings":
+        await warnings(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "warnmode":
         await warnmode_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
@@ -9303,8 +9303,8 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
     elif command == "warntime":
         await warntime_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
-    elif command == "warnings":
-        await warnings(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    elif command == "warns":
+        await warns(client, msg, verified=True, admin_id=callback_query.from_user.id)
     
     elif command == "unwarns":
         await unwarn(client, msg, verified=True, admin_id=callback_query.from_user.id)
@@ -10068,7 +10068,7 @@ def main():
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
         "welcome": welcome_toggle, "setgoodbye": setgoodbye, "resetgoodbye": resetgoodbye,
         "goodbye": goodbye_toggle, "setrules": setrules, "rules": rules, "setnote": setnote,
-        "get": get_note, "delnote": delnote, "warn": warn, "dwarn": dwarn, "warnings": warnings, "warnsettings": warnsettings, "warnconfig": warnsettings, "swarn": swarn,
+        "get": get_note, "delnote": delnote, "warn": warn, "dwarn": dwarn, "warns": warns, "warnings": warnings, "warnconfig": warnings, "swarn": swarn,
         "resetwarns": resetwarns, "unwarn": unwarn, "warnmode": warnmode_cmd, "warninfo": warninfo_cmd,  "resetallwarns": resetallwarns, "warntime": warntime_cmd,
         "mute": mute, "dmute": dmute, "smute": smute, "tmute": tmute, "rmwarn": unwarn, "resetwarn": resetwarns,
         "unmute": unmute, "ban": ban, "sban": sban, "tban": tban, "dban": dban, "unban": unban,
@@ -10160,7 +10160,7 @@ def main():
     async def start_bot():
         await app.start()
         await permapin_messages_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
-        asyncio.create_task(expire_warnings_loop())
+        asyncio.create_task(expire_warns_loop())
         print("Bot is now online and running!")
         await idle()
         await app.stop()
