@@ -122,6 +122,7 @@ pending_admin_actions = {}
 PENDING_ACTION_TIMEOUT = 300  # 5 minutes
 ANONYMOUS_ADMIN_ID = 1087968824
 # --- Global tracking structures ---
+pending_nightmode = {}
 pending_floodmode = {}  # key: unique_id, value: {chat_id, user_id, action, duration_str, message_id}
 active_tagging = {}
 purge_running = {}
@@ -235,6 +236,56 @@ def get_filter_data(message: Message):
     return None
 
 # --- MongoDB e functions ---
+def is_night_time(start_str: str, end_str: str) -> bool:
+    """Return True if current time (Kolkata) is within the given window."""
+    def parse_time(t: str):
+        t = t.strip()
+        if not t:
+            return None
+        parts = t.split()
+        if len(parts) != 2:
+            return None
+        time_part, ampm = parts[0], parts[1].upper()
+        hour_min = time_part.split(":")
+        if len(hour_min) != 2:
+            return None
+        try:
+            hour = int(hour_min[0])
+            minute = int(hour_min[1])
+        except ValueError:
+            return None
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+        return hour, minute
+
+    parsed_start = parse_time(start_str)
+    parsed_end = parse_time(end_str)
+    if parsed_start is None or parsed_end is None:
+        return False
+
+    start_h, start_m = parsed_start
+    end_h, end_m = parsed_end
+
+    # get current time in Kolkata (UTC+5:30)
+    now = datetime.utcnow()
+    kolkata = now + timedelta(hours=5, minutes=30)
+    current_h = kolkata.hour
+    current_m = kolkata.minute
+    current_minutes = current_h * 60 + current_m
+    start_minutes = start_h * 60 + start_m
+    end_minutes = end_h * 60 + end_m
+
+    if start_minutes < end_minutes:
+        return start_minutes <= current_minutes < end_minutes
+    else:
+        # crosses midnight
+        return current_minutes >= start_minutes or current_minutes < end_minutes
+    
+
 def format_duration(seconds: int) -> str:
     """Convert seconds into a human-readable string (e.g., '1h 30m')."""
     if seconds <= 0:
@@ -358,6 +409,24 @@ async def get_anonadmin_enabled(chat_id: int) -> bool:
 
 async def set_anonadmin_enabled(chat_id: int, enabled: bool):
     await set_chat_setting(chat_id, "anonadmin_enabled", to_bool_str(enabled))
+
+async def get_nightmode_enabled(chat_id: int) -> bool:
+    return await get_chat_setting(chat_id, "nightmode_enabled", "0") == "1"
+
+async def set_nightmode_enabled(chat_id: int, enabled: bool):
+    await set_chat_setting(chat_id, "nightmode_enabled", to_bool_str(enabled))
+
+async def get_nightmode_start(chat_id: int) -> str:
+    return await get_chat_setting(chat_id, "nightmode_start", "22:00")
+
+async def set_nightmode_start(chat_id: int, time_str: str):
+    await set_chat_setting(chat_id, "nightmode_start", time_str)
+
+async def get_nightmode_end(chat_id: int) -> str:
+    return await get_chat_setting(chat_id, "nightmode_end", "06:00")
+
+async def set_nightmode_end(chat_id: int, time_str: str):
+    await set_chat_setting(chat_id, "nightmode_end", time_str)
 
 async def get_last_admincache(chat_id: int) -> int:
     val = await get_chat_setting(chat_id, "last_admincache_ts", "0")
@@ -6355,6 +6424,82 @@ async def anonadmin_command(client: Client, message: Message, verified=False, ad
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
+async def nightmode_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    # Bot admin check
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        if await get_anonadmin_enabled(message.chat.id):
+            return await nightmode_cmd(client, message, verified=True, admin_id=0)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_admin_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "action": "nightmode",
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+            ]])
+            await message.reply_text(
+                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+                reply_markup=keyboard
+            )
+            return
+
+    # Admin check for non‑verified
+    if not (verified and message.from_user is None):
+        if not await require_admin(client, message):
+            return
+
+    # Permission check (needs change_info? we'll use change_info as it's a chat setting)
+    user_id = admin_id if admin_id else (message.from_user.id if message.from_user else None)
+    if user_id != 0:
+        if not await user_has_permission(client, message.chat.id, user_id, "can_change_info"):
+            await message.reply_text("❌ You need 'Change Group Info' permission to manage night mode.")
+            return
+
+    chat_id = message.chat.id
+    enabled = await get_nightmode_enabled(chat_id)
+    start = await get_nightmode_start(chat_id)
+    end = await get_nightmode_end(chat_id)
+
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    text = (
+        f"🌙 **Night Mode Settings**\n\n"
+        f"Status: {status}\n"
+        f"Window: {start} → {end} (Kolkata time)\n\n"
+        f"During this window, all media messages (photos, videos, stickers, etc.) from non‑approved users will be automatically deleted.\n"
+        f"Approved users and admins are exempt."
+    )
+
+        # Determine button texts with dots
+    enable_text = " Enable" if enabled else "🟢 Enable"
+    disable_text = "🔴 Disable" if enabled else " Disable"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(enable_text, callback_data=f"nightmode:enable:{chat_id}"),
+            InlineKeyboardButton(disable_text, callback_data=f"nightmode:disable:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton(f"⏰ Set Start ({start})", callback_data=f"nightmode:set_start:{chat_id}"),
+            InlineKeyboardButton(f"⏰ Set End ({end})", callback_data=f"nightmode:set_end:{chat_id}")
+        ],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+
+    await message.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+
+
 # --- Bio system commands ---
 async def allow_bio_user(client: Client, message: Message, verified=False):
     # Only groups allowed
@@ -8056,7 +8201,45 @@ async def safety_handler(client: Client, message: Message):
                     await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False))
                 await message.stop_propagation()
                 return
-            
+
+async def nightmode_handler(client: Client, message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not message.from_user or message.from_user.is_bot:
+        return
+    # Skip if message is from anonymous admin (sender_chat)
+    if message.sender_chat and message.from_user is None:
+        return
+
+    chat_id = message.chat.id
+    if not await get_nightmode_enabled(chat_id):
+        return
+    start = await get_nightmode_start(chat_id)
+    end = await get_nightmode_end(chat_id)
+    if not is_night_time(start, end):
+        return
+
+    user_id = message.from_user.id
+    # Skip admins and approved users
+    if await is_admin(client, message, user_id) or await is_approved(chat_id, user_id):
+        return
+
+    # Check if message contains media
+    media_types = [message.photo, message.video, message.animation, message.sticker, message.voice, message.audio, message.document]
+    if not any(media_types):
+        return
+
+    # Delete the message
+    try:
+        await message.delete()
+        warn_msg = await message.reply_text(
+            f"⚠️ {message.from_user.mention}, media messages are not allowed during night time (Kolkata {start} – {end}).",
+            parse_mode=enums.ParseMode.HTML
+        )
+        asyncio.create_task(delete_after_delay(warn_msg, 5))
+    except Exception as e:
+        print(f"Night mode deletion failed: {e}")
+
 async def pin_event_handler(client: Client, message: Message):
     pinned = message.pinned_message
     if not pinned:
@@ -9557,7 +9740,10 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
 
     elif command == "unpin":
         await unpin_message(client, msg, verified=True, admin_id=callback_query.from_user.id)
-       
+
+    elif command == "nightmode":
+        await nightmode_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    
     elif command == "allow_bio":
         await allow_bio_user(client, msg, verified=True)
 
@@ -10365,6 +10551,172 @@ async def run_web():
     # Keep the server alive forever
     await asyncio.Event().wait()
 
+async def nightmode_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) < 2:
+        return
+    action = parts[1]
+    chat_id = int(parts[2])
+    user_id = callback_query.from_user.id
+
+    # Verify admin
+    if not await is_admin(client, callback_query.message, user_id):
+        await callback_query.answer("❌ You are not an admin!", show_alert=True)
+        return
+
+    if action == "enable":
+        await set_nightmode_enabled(chat_id, True)
+        await callback_query.answer("✅ Night mode enabled.", show_alert=False)
+    elif action == "disable":
+        await set_nightmode_enabled(chat_id, False)
+        await callback_query.answer("❌ Night mode disabled.", show_alert=False)
+    elif action == "set_start":
+        # Start time picker
+        session_id = str(uuid.uuid4())
+        pending_nightmode[session_id] = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "mode": "start",
+            "hour": None,
+            "ampm": None,
+            "message_id": callback_query.message.id
+        }
+        # Show hour selection
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(i), callback_data=f"nightmode_hour:{session_id}:{i}") for i in range(1, 7)],
+            [InlineKeyboardButton(str(i), callback_data=f"nightmode_hour:{session_id}:{i}") for i in range(7, 13)],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"nightmode_cancel:{session_id}")]
+        ])
+        await callback_query.edit_message_text("Select hour (1‑12):", reply_markup=keyboard)
+        await callback_query.answer()
+        return
+    elif action == "set_end":
+        session_id = str(uuid.uuid4())
+        pending_nightmode[session_id] = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "mode": "end",
+            "hour": None,
+            "ampm": None,
+            "message_id": callback_query.message.id
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(i), callback_data=f"nightmode_hour:{session_id}:{i}") for i in range(1, 7)],
+            [InlineKeyboardButton(str(i), callback_data=f"nightmode_hour:{session_id}:{i}") for i in range(7, 13)],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"nightmode_cancel:{session_id}")]
+        ])
+        await callback_query.edit_message_text("Select hour (1‑12):", reply_markup=keyboard)
+        await callback_query.answer()
+        return
+    else:
+        return
+
+    # Refresh main menu
+    await refresh_nightmode_menu(client, callback_query, chat_id)
+
+async def nightmode_hour_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    session_id = parts[1]
+    hour = int(parts[2])
+    session = pending_nightmode.get(session_id)
+    if not session:
+        await callback_query.answer("Session expired. Use /setnight again.", show_alert=True)
+        return
+    if session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("This button is not for you.", show_alert=True)
+        return
+
+    session["hour"] = hour
+    # Ask for AM/PM
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("AM", callback_data=f"nightmode_ampm:{session_id}:AM"),
+         InlineKeyboardButton("PM", callback_data=f"nightmode_ampm:{session_id}:PM")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"nightmode_cancel:{session_id}")]
+    ])
+    await callback_query.edit_message_text(f"Hour {hour} selected. Choose AM/PM:", reply_markup=keyboard)
+    await callback_query.answer()
+
+async def nightmode_ampm_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    session_id = parts[1]
+    ampm = parts[2]
+    session = pending_nightmode.get(session_id)
+    if not session:
+        await callback_query.answer("Session expired. Use /setnight again.", show_alert=True)
+        return
+    if session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("This button is not for you.", show_alert=True)
+        return
+
+    session["ampm"] = ampm
+    # Build the time string: hour:00 AM/PM (we can set minutes to 00 for simplicity)
+    time_str = f"{session['hour']}:00 {ampm}"
+    chat_id = session["chat_id"]
+    if session["mode"] == "start":
+        await set_nightmode_start(chat_id, time_str)
+        await callback_query.answer(f"Start time set to {time_str}", show_alert=False)
+    else:
+        await set_nightmode_end(chat_id, time_str)
+        await callback_query.answer(f"End time set to {time_str}", show_alert=False)
+
+    # Refresh main menu
+    await refresh_nightmode_menu(client, callback_query, chat_id)
+    del pending_nightmode[session_id]
+
+async def nightmode_cancel_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_nightmode.get(session_id)
+    if session and session["user_id"] == callback_query.from_user.id:
+        chat_id = session["chat_id"]
+        del pending_nightmode[session_id]
+        await refresh_nightmode_menu(client, callback_query, chat_id)
+    else:
+        await callback_query.answer("Cancelled.", show_alert=False)
+
+async def refresh_nightmode_menu(client, callback_query, chat_id):
+    enabled = await get_nightmode_enabled(chat_id)
+    start = await get_nightmode_start(chat_id)
+    end = await get_nightmode_end(chat_id)
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    text = (
+        f"🌙 **Night Mode Settings**\n\n"
+        f"Status: {status}\n"
+        f"Window: {start} → {end} (Kolkata time)\n\n"
+        f"During this window, all media messages (photos, videos, stickers, etc.) from non‑approved users will be automatically deleted.\n"
+        f"Approved users and admins are exempt."
+    )
+    enable_text = " Enable" if not enabled else "🟢 Enable"
+    disable_text = "🔴 Disable" if not enabled else " Disable"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(enable_text, callback_data=f"nightmode:enable:{chat_id}"),
+            InlineKeyboardButton(disable_text, callback_data=f"nightmode:disable:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton(f"⏰ Set Start ({start})", callback_data=f"nightmode:set_start:{chat_id}"),
+            InlineKeyboardButton(f"⏰ Set End ({end})", callback_data=f"nightmode:set_end:{chat_id}")
+        ],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+    
+    try:
+        await callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+    except MessageNotModified:
+        pass
+
+
+
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
@@ -10375,7 +10727,7 @@ def main():
         "enable": enable_cmd, "disabled": disabled_cmds, "setlogchannel": set_log_channel,
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
         "welcome": welcome_toggle, "setgoodbye": setgoodbye, "resetgoodbye": resetgoodbye,
-        "goodbye": goodbye_toggle, "setrules": setrules, "rules": rules, "setnote": setnote,
+        "goodbye": goodbye_toggle, "setrules": setrules, "rules": rules, "setnote": setnote, "setnight": nightmode_cmd,
         "get": get_note, "delnote": delnote, "warn": warn, "dwarn": dwarn, "warns": warns, "warnings": warnings, "warnconfig": warnings, "swarn": swarn,
         "resetwarns": resetwarns, "unwarn": unwarn, "warnmode": warnmode_cmd, "warninfo": warninfo_cmd,  "resetallwarns": resetallwarns, "warntime": warntime_cmd,
         "mute": mute, "dmute": dmute, "smute": smute, "tmute": tmute, "rmwarn": unwarn, "resetwarn": resetwarns,
@@ -10448,6 +10800,10 @@ def main():
     # In main(), after other callback handlers
     app.add_handler(CallbackQueryHandler(warnmode_digit_callback, filters.regex(r"^warnmode_(digit|clear|back|ok)")))
     app.add_handler(CallbackQueryHandler(warn_buttons, filters.regex(r"^(rmwarn|resetwarn):")))
+    app.add_handler(CallbackQueryHandler(nightmode_callback, filters.regex(r"^nightmode:")))
+    app.add_handler(CallbackQueryHandler(nightmode_hour_callback, filters.regex(r"^nightmode_hour:")))
+    app.add_handler(CallbackQueryHandler(nightmode_ampm_callback, filters.regex(r"^nightmode_ampm:")))
+    app.add_handler(CallbackQueryHandler(nightmode_cancel_callback, filters.regex(r"^nightmode_cancel:")))
     
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
@@ -10467,7 +10823,8 @@ def main():
     app.add_handler(MessageHandler(pin_event_handler, filters.pinned_message), group=8)
     app.add_handler(MessageHandler(cleanlinked_handler, filters.group), group=9)
     app.add_handler(MessageHandler(unsubscribe_fed, filters.command("unsubfed")))
-
+    app.add_handler(MessageHandler(nightmode_handler, filters.group & ~filters.service), group=3)
+    
     async def start_bot():
         await app.start()
         asyncio.create_task(run_web())
