@@ -3,6 +3,8 @@ import os
 import re
 import time
 import uuid
+import aiohttp
+from aiohttp import web
 from collections import defaultdict, deque
 from contextlib import suppress
 from datetime import datetime, timedelta
@@ -71,22 +73,29 @@ system_info_col = mongo_db["system_info"]
 permapin_messages_col = mongo_db["permapin_messages"]
 
 # --- Link detection regex ---
+import re
+
+# Expanded list of TLDs – add any that are common in your group
+TLDS = (
+    'com|org|net|in|co|io|xyz|me|info|biz|edu|gov|mil|name|pro|club|online|site|space|tech|app'
+)
+
 BIO_LINK_PATTERNS = [
-    r'http[s]?://\S+',
-    r'www\.\S+',
-    r't\.me/\S+',
-    r'\S+\.(com|org|net|in|co|io|xyz|me|info)\b'
+    r'https?://\S+',                     # http:// or https://
+    r'www\.\S+',                         # www.
+    r't\.me/\S+',                        # t.me/ links
+    r'\S+\.(' + TLDS + r')(?:\b|/|\?)', # any word followed by a TLD and then word boundary, slash, or ?
+    r'\S+\.\w{2,}/?\S*',                # generic domain with at least two letters in TLD (fallback)
 ]
 
 def has_link(text: str) -> bool:
+    """Return True if the text contains any link."""
     if not text:
         return False
     for pattern in BIO_LINK_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
-
-import re
 
 EMOJI_PATTERN = re.compile(
     r'[\U0001F600-\U0001F64F]|'   # Emoticons
@@ -123,6 +132,7 @@ flood_tracker: dict[tuple[int, int], deque] = defaultdict(deque)
 LOCK_TYPES = {"media", "sticker", "gif", "voice", "poll", "link", "emoji", "text"}
 active_users: dict[int, deque[int]] = defaultdict(lambda: deque(maxlen=300))
 flood_timer_tracker: dict[tuple[int, int], list] = defaultdict(list)
+pending_warnmode = {}  # key: session_id, value: {chat_id, user_id, action, duration_min_str, message_id}
 
 # --- Language support (English only now, but structure kept for future) ---
 LANG = {
@@ -224,7 +234,29 @@ def get_filter_data(message: Message):
         return {"type": "voice", "file_id": message.voice.file_id}
     return None
 
-# --- MongoDB helper functions ---
+# --- MongoDB e functions ---
+def format_duration(seconds: int) -> str:
+    """Convert seconds into a human-readable string (e.g., '1h 30m')."""
+    if seconds <= 0:
+        return "0s"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if secs > 0 and not parts:  # only show seconds if nothing else
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+def to_datetime(ts):
+    return datetime.fromtimestamp(ts) if ts is not None else None
+
 def get_clearflood_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     """Build the clearflood inline keyboard with green tick when enabled."""
     enable_text = "✅ Enable" if enabled else "Enable"
@@ -283,6 +315,25 @@ def build_number_pad(current_duration: str) -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton("⬅️ Back", callback_data="floodmode_back"),
         InlineKeyboardButton("✅ OK", callback_data="floodmode_ok")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+def build_number_pad_warnmode(current_duration: str) -> InlineKeyboardMarkup:
+    """Number pad for warnmode duration input."""
+    rows = []
+    for i in range(1, 10, 3):
+        row = []
+        for j in range(3):
+            digit = str(i + j)
+            row.append(InlineKeyboardButton(digit, callback_data=f"warnmode_digit:{digit}"))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("0", callback_data="warnmode_digit:0"),
+        InlineKeyboardButton("⌫ Clear", callback_data="warnmode_clear")
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="warnmode_back"),
+        InlineKeyboardButton("✅ OK", callback_data="warnmode_ok")
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -1652,7 +1703,7 @@ async def get_note(client: Client, message: Message) -> None:
     # --- NEW: Bot must be admin and have restrict members permission ---
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
     args = get_args(message)
     if not args:
         return
@@ -1661,7 +1712,7 @@ async def get_note(client: Client, message: Message) -> None:
     if doc:
         await message.reply_text(doc["content"], parse_mode=enums.ParseMode.HTML)
 
-async def warn_common(client: Client, message: Message, delete_cmd: bool = False, silent: bool = False, delete_replied: bool = False, admin_id: int = None) -> None:
+async def warn_common(client: Client, message: Message, delete_cmd: bool = False, silent: bool = False, delete_replied: bool = False, admin_id: int = None, cmd_type: str = None) -> None:
     
     target = await get_target_user(client, message)
     if not target:
@@ -1722,6 +1773,29 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
     cnt = len(doc.get("warns", []))
     limit = int(await get_chat_setting(chat_id, "warn_limit", "3"))
 
+    cmd = cmd_type or (message.command[0] if getattr(message, "command", None) else "")
+
+    # 👇 ADD THIS BLOCK
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    try:
+        if cmd in ("warn", "dwarn"):
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("❌ Remove Warn", callback_data=f"rmwarn:{chat_id}:{uid}"),
+                    InlineKeyboardButton("🔄 Reset Warns", callback_data=f"resetwarn:{chat_id}:{uid}")
+                ]
+            ])
+
+            await message.reply_text(
+                f"⚠️ {target.mention} has been warned! ({cnt}/{limit})\n"
+                f"Reason: {reason or 'No reason'}",
+                reply_markup=keyboard
+            )
+
+    except Exception as e:
+        print(f"Warn notify error: {e}")
+
     if cnt >= limit:
         action = await get_warn_action(chat_id)
         now = int(time.time())
@@ -1740,11 +1814,11 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
                 await client.unban_chat_member(chat_id, uid)
                 action_text = "kicked"
             elif action == "tban":
-                await client.ban_chat_member(chat_id, uid, until_date=until)
-                action_text = f"temp banned for {duration//3600}h"
+                    await client.ban_chat_member(chat_id, uid, until_date=to_datetime(until))
+                    action_text = f"temp banned for {format_duration(duration)}"
             elif action == "tmute":
-                await client.restrict_chat_member(chat_id, uid, ChatPermissions(can_send_messages=False), until_date=until)
-                action_text = f"temp muted for {duration//3600}h"
+                    await client.restrict_chat_member(chat_id, uid, ChatPermissions(can_send_messages=False), until_date=to_datetime(until))
+                    action_text = f"temp muted for {format_duration(duration)}"
             else:
                 action_text = "action applied"
         except Exception as e:
@@ -1754,36 +1828,19 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
         # Delete all warns after punishment
         await warns_col.delete_one({"chat_id": chat_id, "user_id": uid})
 
-        if not silent:
+        if cmd in ["warn", "dwarn"]:
             reply = f"⚠️ {target.mention} exceeded warn limit ({cnt}/{limit}) and was {action_text}."
             if reason:
                 reply += f"\n**Reason:** {reason}"
-            await message.reply_text(reply)
-
-    else:
-        if not silent:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Remove Warn", callback_data=f"rmwarn:{chat_id}:{uid}")
-            ]])
-            reply = f"⚠️ {target.mention} warned. Count: {cnt}/{limit}"
-            if reason:
-                reply += f"\n**Reason:** {reason}"
-            await message.reply_text(reply, reply_markup=keyboard)
-
-    # Delete replied message if requested
-    if delete_replied and message.reply_to_message:
-        if await bot_has_permission(client, chat_id, "can_delete_messages"):
-            with suppress(Exception):
-                await message.reply_to_message.delete()
-        else:
-            await message.reply_text(
-                "⚠️ I don't have permission to delete messages. The warning was still issued, but the message was not deleted."
-            )
-
-    # Delete command message if requested
-    if delete_cmd:
-        with suppress(Exception):
-            await message.delete()
+            try:
+                # Optional: check if bot can send messages
+                if await bot_has_permission(client, chat_id, "can_send_messages"):
+                    await message.reply_text(reply)
+                else:
+                    # fallback: send as a new message (not a reply)
+                    await client.send_message(chat_id, reply)
+            except Exception as e:
+                print(f"Error sending warn notification: {e}")
             
 async def warnings(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
@@ -1832,11 +1889,15 @@ async def warnings(client: Client, message: Message, verified=False, admin_id: i
 
     limit = await get_warn_limit(chat_id)
     mode = await get_warn_action(chat_id)
-
+    duration = await get_chat_setting(chat_id, "warn_duration", "0")
+    if mode in ("tban", "tmute"):
+        duration_text = f" (Duration: {int(duration)//60} minutes)" if duration != "0" else ""
+    else:
+        duration_text = ""
     text = (
         f"⚙️ **Warning Settings for {chat_title}**\n\n"
         f"⚠️ Warn Limit: {limit}\n"
-        f"🔨 Action Mode: {mode}"
+        f"🔨 Action Mode: {mode}{duration_text}"
     )
 
     await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
@@ -2265,7 +2326,7 @@ async def warn(client: Client, message: Message) -> None:
         return
 
     # normal admin flow
-    await warn_common(client, message)
+    await warn_common(client, message, silent=False, cmd_type="warn")
 
 async def dwarn(client: Client, message: Message) -> None:
     # 1. Target check
@@ -2333,6 +2394,7 @@ async def dwarn(client: Client, message: Message) -> None:
     except:
         pass
     
+    await warn_common(client, message, delete_cmd=True, silent=False, delete_replied=True, cmd_type="dwarn")
 
 async def swarn(client: Client, message: Message) -> None:
     if message.from_user is None and message.sender_chat:
@@ -2367,7 +2429,7 @@ async def swarn(client: Client, message: Message) -> None:
             reply_markup=keyboard
         )
 
-    await warn_common(client, message, delete_cmd=True, silent=True, delete_replied=False)
+    await warn_common(client, message, delete_cmd=True, silent=True, delete_replied=False, cmd_type="swarn")
 
 async def warns(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
@@ -2506,11 +2568,9 @@ async def do_restrict(client: Client, message: Message, mode: str) -> None:
             secs = parse_duration(args[0])
             if secs > 0:
                 until_date = int(time.time()) + secs
-        await client.restrict_chat_member(
-            chat_id, uid,
-            ChatPermissions(can_send_messages=False),
-            until_date=until_date
-        )
+        # Convert to datetime if needed
+        await client.restrict_chat_member(chat_id, uid, ChatPermissions(can_send_messages=False), until_date=to_datetime(until_date))
+    
         if mode == "dmute" and message.reply_to_message:
             with suppress(Exception):
                 await message.reply_to_message.delete()
@@ -2525,7 +2585,8 @@ async def do_restrict(client: Client, message: Message, mode: str) -> None:
             secs = parse_duration(args[0])
             if secs > 0:
                 until_date = int(time.time()) + secs
-        await client.ban_chat_member(chat_id, uid, until_date=until_date)
+        # Convert to datetime if needed
+        await client.ban_chat_member(chat_id, uid, until_date=to_datetime(until_date))
         if mode in {"kick", "dkick", "skick"}:
             await client.unban_chat_member(chat_id, uid)
         if mode not in {"sban", "skick"}:
@@ -2810,6 +2871,8 @@ async def tmute(client: Client, message: Message, verified=False, admin_id: int 
         return await message.reply_text("Usage: /tmute 10m")
 
     duration = parse_duration(args[0])
+    if duration == 0:
+        return await message.reply_text("Invalid duration format. Use: 1h, 30m, 2d, etc.")
 
     target = await get_target_user(client, message)
     if not target:
@@ -2821,22 +2884,22 @@ async def tmute(client: Client, message: Message, verified=False, admin_id: int 
     if await is_admin(client, message, uid):
         return await message.reply_text("❌ It is not possible to mute an admin.")
 
-    until = int(time.time()) + duration
-
+    # Get member to check if already muted
     member = await client.get_chat_member(message.chat.id, uid)
 
     # Already muted check
     if member.permissions and not member.permissions.can_send_messages:
         return await message.reply_text("⚠️ User is already muted.")
 
+    until = int(time.time()) + duration
     await client.restrict_chat_member(
         message.chat.id,
         uid,
         ChatPermissions(can_send_messages=False),
-        until_date=until
+        until_date=to_datetime(until)
     )
 
-    await message.reply_text(f"🔇 {target.mention} muted for {args[0]}.")          
+    await message.reply_text(f"🔇 {target.mention} muted for {args[0]}.")
 
 async def unmute(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
@@ -3158,11 +3221,8 @@ async def tban(client: Client, message: Message, verified=False, admin_id: int =
             duration = secs
 
     until = int(time.time()) + duration
-    await client.ban_chat_member(
-        message.chat.id,
-        user.id,
-        until_date=until
-    )
+    await client.ban_chat_member(message.chat.id, user.id, until_date=to_datetime(until))
+
     await message.reply_text(f"{user.mention} banned for {duration//3600} hour(s).")
 
 async def unban(client: Client, message: Message, verified=False, admin_id: int = None):
@@ -6494,10 +6554,11 @@ async def bioconfig_cmd(client: Client, message: Message, verified=False):
     await message.reply_text(text, reply_markup=keyboard)        
 
 async def bio_and_link_scanner(client: Client, message: Message):
-    if not message.from_user or message.chat.type == enums.ChatType.PRIVATE:
+    # Ignore private chats, bots, and service messages
+    if not message.from_user or message.chat.type == enums.ChatType.PRIVATE or message.from_user.is_bot:
         return
 
-    # Skip if anonymous admin with anonadmin enabled
+    # Skip anonymous admin messages if the setting is enabled
     if message.sender_chat and message.from_user is None:
         if await get_anonadmin_enabled(message.chat.id):
             return
@@ -6508,55 +6569,80 @@ async def bio_and_link_scanner(client: Client, message: Message):
         return
 
     user_id = message.from_user.id
-    if await is_admin(client, message, user_id):
+
+    # Skip admins and approved users
+    if await is_admin(client, message, user_id) or await is_approved(chat_id, user_id):
         return
 
-    is_allowed = await bio_allowlist_col.find_one({"user_id": user_id})
-    if is_allowed:
+    # Skip allowlisted users
+    if await bio_allowlist_col.find_one({"user_id": user_id}):
         return
 
-    await increment_bio_stat("scanned")
+    # Check message for link
     msg_text = message.text or message.caption or ""
-    violation, reason = False, ""
-
     if has_link(msg_text):
-        violation, reason = True, "Link in Message"
+        violation = True
+        reason = "Link in Message"
     else:
-        now = time.time()
-        cached_bio = bio_cache.get(user_id)
-        if not cached_bio or (now - cached_bio['time']) > 600:
+        # Fetch user's bio (no cache – get fresh each time to catch new links)
+        try:
+            user = await client.get_chat(user_id)
+            user_bio = user.bio
+        except Exception as e:
+            # If we can't fetch the bio, assume no violation
+            user_bio = None
+        violation = user_bio and has_link(user_bio)
+        reason = "Link in Bio" if violation else ""
+
+    if not violation:
+        return
+
+    # Try to delete the offending message
+    try:
+        await message.delete()
+    except Exception as e:
+        # If deletion fails, notify the chat (only once per minute to avoid spam)
+        # (We'll send a warning later anyway)
+        pass
+
+    # Update warnings count
+    warn_doc = await bio_warns_col.find_one_and_update(
+        {"chat_id": chat_id, "user_id": user_id},
+        {"$inc": {"count": 1}},
+        upsert=True,
+        return_document=True
+    )
+    count = warn_doc["count"]
+    safe_name = escape(message.from_user.first_name)
+    user_id = message.from_user.id
+    mention = message.from_user.mention
+
+    # If warnings reach limit, apply punishment
+    if count >= warn_limit:
+        # Check if bot has the necessary permissions before punishing
+        bot_member = await client.get_chat_member(chat_id, (await client.get_me()).id)
+        if bot_member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+            await client.send_message(
+                chat_id,
+                f"⚠️ **Bio warning failed**: I am not an admin in this chat.\n"
+                f"User {mention} has {count}/{warn_limit} warnings (link in {reason}).",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            return
+
+        if action == "mute":
+            if not bot_member.privileges.can_restrict_members:
+                await client.send_message(
+                    chat_id,
+                    f"⚠️ **Bio warning failed**: I don't have permission to restrict members.\n"
+                    f"User {mention} has {count}/{warn_limit} warnings (link in {reason}).",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+                return
             try:
-                chat = await client.get_chat(user_id)
-                bio_cache[user_id] = {'bio': chat.bio, 'time': now}
-                user_bio = chat.bio
-            except:
-                user_bio = None
-        else:
-            user_bio = cached_bio['bio']
-
-        if user_bio and has_link(user_bio):
-            violation, reason = True, "Link in Bio"
-            await increment_bio_stat("caught")
-
-    if violation:
-        with suppress(Exception):
-            await message.delete()
-
-        warn_doc = await bio_warns_col.find_one_and_update(
-            {"chat_id": chat_id, "user_id": user_id},
-            {"$inc": {"count": 1}},
-            upsert=True,
-            return_document=True
-        )
-        count = warn_doc["count"]
-        safe_name = escape(message.from_user.first_name)
-        user_id = message.from_user.id
-        mention = message.from_user.mention
-
-        if count >= warn_limit:
-            if action == "mute":
-                with suppress(Exception):
-                    await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False))
+                await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False))
+                # Clear warnings after successful punishment
+                await bio_warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
                 text = (
                     f"🔇 <b>User Muted Indefinitely</b>\n\n"
                     f"👤 <b>User:</b> {mention}\n"
@@ -6564,9 +6650,25 @@ async def bio_and_link_scanner(client: Client, message: Message):
                     f"📝 <b>Reason:</b> {reason}"
                 )
                 btn = InlineKeyboardButton("🔊 Unmute", callback_data=f"bio_unmute_{user_id}")
-            else:
-                with suppress(Exception):
-                    await client.ban_chat_member(chat_id, user_id)
+            except Exception as e:
+                await client.send_message(
+                    chat_id,
+                    f"⚠️ **Bio warning failed**: Could not mute user {mention}.\nError: {e}",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+                return
+        else:  # ban
+            if not bot_member.privileges.can_restrict_members:
+                await client.send_message(
+                    chat_id,
+                    f"⚠️ **Bio warning failed**: I don't have permission to restrict members.\n"
+                    f"User {mention} has {count}/{warn_limit} warnings (link in {reason}).",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+                return
+            try:
+                await client.ban_chat_member(chat_id, user_id)
+                await bio_warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
                 text = (
                     f"🚫 <b>User Banned</b>\n\n"
                     f"👤 <b>User:</b> {mention}\n"
@@ -6574,24 +6676,39 @@ async def bio_and_link_scanner(client: Client, message: Message):
                     f"📝 <b>Reason:</b> {reason}"
                 )
                 btn = InlineKeyboardButton("🔓 Unban", callback_data=f"bio_unban_{user_id}")
+            except Exception as e:
+                await client.send_message(
+                    chat_id,
+                    f"⚠️ **Bio warning failed**: Could not ban user {mention}.\nError: {e}",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+                return
 
-            keyboard = InlineKeyboardMarkup([[btn], [InlineKeyboardButton("🗑 Delete", callback_data="del_msg")]])
-            await client.send_message(chat_id, text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
-        else:
-            text = (
-                f"⚠️ <b>MESSAGE REMOVED (Link Detected)</b>\n\n"
-                f"👤 <b>User:</b> {mention}\n"
-                f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-                f"📝 <b>Reason:</b> {reason}\n"
-                f"📊 <b>warns:</b> {count}/{warn_limit}\n\n"
-                f"🛑 <i>Notice: Please remove any links from your Bio or messages.</i>\n\n"
-                f"📌 REPEATED VIOLATIONS WILL LEAD TO MUTE/BAN."
-            )
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Allow", callback_data=f"bio_allow_{user_id}"), InlineKeyboardButton("🛡 Unwarn", callback_data=f"bio_unwarn_{user_id}")],
-                [InlineKeyboardButton("🗑 Delete", callback_data="del_msg")]
-            ])
-            await client.send_message(chat_id, text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+        keyboard = InlineKeyboardMarkup([[btn], [InlineKeyboardButton("🗑 Delete", callback_data="del_msg")]])
+        await client.send_message(chat_id, text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+
+    else:
+        # Not yet at limit – send warning message
+        text = (
+            f"⚠️ <b>MESSAGE REMOVED (Link Detected)</b>\n\n"
+            f"👤 <b>User:</b> {mention}\n"
+            f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+            f"📝 <b>Reason:</b> {reason}\n"
+            f"📊 <b>warns:</b> {count}/{warn_limit}\n\n"
+            f"🛑 <i>Please remove any links from your Bio or messages.</i>\n\n"
+            f"📌 REPEATED VIOLATIONS WILL LEAD TO MUTE/BAN."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Allow", callback_data=f"bio_allow_{user_id}"),
+             InlineKeyboardButton("🛡 Unwarn", callback_data=f"bio_unwarn_{user_id}")],
+            [InlineKeyboardButton("🗑 Delete", callback_data="del_msg")]
+        ])
+        await client.send_message(chat_id, text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+
+    # Update stats
+    await increment_bio_stat("scanned")
+    if violation:
+        await increment_bio_stat("caught")
 
 async def set_vc_msg(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     
@@ -7912,10 +8029,12 @@ async def safety_handler(client: Client, message: Message):
                 await client.ban_chat_member(chat_id, user_id)
             elif mode == "mute":
                 await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False))
-            elif mode == "tban":
-                await client.ban_chat_member(chat_id, user_id, until_date=until)
+            
+            until = int(time.time()) + duration if mode in ("tban", "tmute") else None
+            if mode == "tban":
+                await client.ban_chat_member(chat_id, user_id, until_date=to_datetime(until))
             elif mode == "tmute":
-                await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False), until_date=until)
+                await client.restrict_chat_member(chat_id, user_id, ChatPermissions(can_send_messages=False), until_date=to_datetime(until))
             await message.stop_propagation()
             return
     else:
@@ -8853,8 +8972,8 @@ async def warnmode_callback(client: Client, callback_query: CallbackQuery):
     data = q.data
     if data == "warnmode:back":
         # Go back to main warnmode menu
-        await warnmode_cmd(client, q.message)  # but we need to edit message, not send new
-        # Better to re-build and edit
+        await warnmode_cmd(client, q.message)
+        # Re-fetch current values and rebuild
         chat_id = q.message.chat.id
         current_action = await get_warn_action(chat_id)
         current_limit = await get_warn_limit(chat_id)
@@ -8883,7 +9002,26 @@ async def warnmode_callback(client: Client, callback_query: CallbackQuery):
         await q.answer("❌ You are not an admin!", show_alert=True)
         return
 
+    # If the action is temporary, show number pad
+    if action in ("tban", "tmute"):
+        session_id = str(uuid.uuid4())
+        pending_warnmode[session_id] = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "action": action,
+            "duration_min_str": "",
+            "message_id": q.message.id,
+        }
+        text = f"**Selected action:** {action.upper()}\n\nEnter duration in **minutes**:\n\nCurrent: 0"
+        keyboard = build_number_pad_warnmode("")
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+        return
+
+    # For non‑temporary actions, set directly
     await set_warn_action(chat_id, action)
+    # Also clear any previous duration if exists
+    await set_chat_setting(chat_id, "warn_duration", "0")
     await q.answer(f"✅ Warn action set to {action.upper()}", show_alert=False)
 
     # Refresh message
@@ -10064,6 +10202,169 @@ async def clearflood_callback(client: Client, callback_query: CallbackQuery):
     except MessageNotModified:
         pass
 
+async def warnmode_digit_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    if not data.startswith("warnmode_"):
+        return
+    # now proceed...
+    """Handle digit input for warnmode duration."""
+    q = callback_query
+    data = q.data
+    user_id = q.from_user.id
+
+    # Find the session for this user in this chat
+    session = None
+    session_id = None
+    for sid, s in pending_warnmode.items():
+        if s["user_id"] == user_id and s["chat_id"] == q.message.chat.id:
+            session = s
+            session_id = sid
+            break
+
+    if not session:
+        await q.answer("Session expired. Please run /warnmode again.", show_alert=True)
+        return
+
+    if not await is_admin(client, q.message, user_id):
+        await q.answer("❌ You are not an admin!", show_alert=True)
+        return
+
+    if data.startswith("warnmode_digit:"):
+        digit = data.split(":")[1]
+        session["duration_min_str"] += digit
+        text = f"**Selected action:** {session['action'].upper()}\n\nEnter duration in **minutes**:\n\nCurrent: {session['duration_min_str']}"
+        keyboard = build_number_pad_warnmode(session["duration_min_str"])
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+
+    elif data == "warnmode_clear":
+        session["duration_min_str"] = ""
+        text = f"**Selected action:** {session['action'].upper()}\n\nEnter duration in **minutes**:\n\nCurrent: 0"
+        keyboard = build_number_pad_warnmode("")
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+
+    elif data == "warnmode_back":
+        # Go back to main menu
+        del pending_warnmode[session_id]
+        # Re‑render the action selection menu
+        chat_id = session["chat_id"]
+        current_action = await get_warn_action(chat_id)
+        current_limit = await get_warn_limit(chat_id)
+        text = f"**⚙️ Warn Action Configuration**\n\nCurrent action: **{current_action.upper()}**\nCurrent limit: **{current_limit}**\nSelect new action:"
+        actions = ["ban", "mute", "kick", "tban", "tmute"]
+        buttons = []
+        row = []
+        for i, a in enumerate(actions):
+            display = f"✅ {a.upper()}" if a == current_action else a.upper()
+            row.append(InlineKeyboardButton(display, callback_data=f"warnmode:{a}"))
+            if len(row) == 2 or i == len(actions)-1:
+                buttons.append(row)
+                row = []
+        buttons.append([InlineKeyboardButton(f"🔢 Change Warn Limit ({current_limit})", callback_data="warnlimit:menu")])
+        buttons.append([InlineKeyboardButton("🗑 Close", callback_data="del_msg")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=enums.ParseMode.MARKDOWN)
+        await q.answer()
+
+    elif data == "warnmode_ok":
+        minutes_str = session["duration_min_str"]
+        if not minutes_str or int(minutes_str) == 0:
+            await q.answer("Please enter a valid duration (positive number of minutes).", show_alert=True)
+            return
+        minutes = int(minutes_str)
+        seconds = minutes * 60
+        # Save action and duration
+        await set_warn_action(session["chat_id"], session["action"])
+        await set_chat_setting(session["chat_id"], "warn_duration", str(seconds))
+        await q.edit_message_text(f"✅ Warn action set to **{session['action'].upper()}** with duration **{minutes} minute(s)**.")
+        await q.answer(f"Action set to {session['action']} with {minutes} minute(s)", show_alert=False)
+        del pending_warnmode[session_id]
+
+async def warn_buttons(client, query: CallbackQuery):
+    data = query.data.split(":")
+    action, chat_id, user_id = data[0], int(data[1]), int(data[2])
+
+    # 🔒 ADMIN CHECK
+    try:
+        member = await client.get_chat_member(chat_id, query.from_user.id)
+
+        # 👑 creator always allowed
+        if member.status == "creator":
+            pass
+
+        # 👮 admin but must have restrict permission
+        elif member.status == "administrator":
+            if not (member.privileges and member.privileges.can_restrict_members):
+                return await query.answer("❌ You need ban permission!", show_alert=True)
+
+        # ❌ normal users blocked
+        
+    except Exception as e:
+        return await query.answer("Error checking admin!", show_alert=True)
+
+    # ✅ REMOVE LAST WARN
+    if action == "rmwarn":
+        doc = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
+
+        if doc and doc.get("warns"):
+            doc["warns"].pop()
+
+            await warns_col.update_one(
+                {"chat_id": chat_id, "user_id": user_id},
+                {"$set": {"warns": doc["warns"]}}
+            )
+
+            await query.answer("Last warn removed ✅")
+
+            try:
+                user = await client.get_users(user_id)
+
+                await query.message.reply_text(
+                    f"❌ Last warning removed for {user.mention} by {query.from_user.mention}."
+                )
+            except Exception as e:
+                print(f"Remove notify error: {e}")
+
+        else:
+            await query.answer("❌ No warns to remove!", show_alert=True)
+
+    # ✅ RESET ALL WARNS
+    elif action == "resetwarn":
+        doc = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
+
+        # ❌ agar warn hi nahi hai
+        if not doc or not doc.get("warns"):
+            return await query.answer("❌ There are no warnings to reset!", show_alert=True)
+
+        # ✅ reset
+        await warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
+
+        await query.answer("All warns reset ✅")
+
+        try:
+            user = await client.get_users(user_id)
+
+            await query.message.reply_text(
+                f"🔄 All warnings for {user.mention} have been reset by {query.from_user.mention}."
+            )
+        except Exception as e:
+            print(f"Reset notify error: {e}")
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def run_web():
+    """Start a minimal HTTP server for Render health checks."""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('PORT', 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    # Keep the server alive forever
+    await asyncio.Event().wait()
+
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
@@ -10144,7 +10445,10 @@ def main():
     app.add_handler(CallbackQueryHandler(setfloodmode_action_callback, filters.regex(r"^setfloodmode_action:")))
     app.add_handler(CallbackQueryHandler(setfloodmode_duration_callback, filters.regex(r"^floodmode_")))
     app.add_handler(CallbackQueryHandler(clearflood_callback, filters.regex(r"^clearflood:")))
-
+    # In main(), after other callback handlers
+    app.add_handler(CallbackQueryHandler(warnmode_digit_callback, filters.regex(r"^warnmode_(digit|clear|back|ok)")))
+    app.add_handler(CallbackQueryHandler(warn_buttons, filters.regex(r"^(rmwarn|resetwarn):")))
+    
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
     app.add_handler(MessageHandler(on_left_member, filters.left_chat_member))
@@ -10166,6 +10470,7 @@ def main():
 
     async def start_bot():
         await app.start()
+        asyncio.create_task(run_web())
         await permapin_messages_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
         asyncio.create_task(expire_warns_loop())
         print("Bot is now online and running!")
