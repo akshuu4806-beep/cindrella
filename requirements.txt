@@ -3,3 +3,4 @@ motor
 python-dotenv
 pymongo
 tgcrypto
+aiohttp==3.10.0
