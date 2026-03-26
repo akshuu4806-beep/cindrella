@@ -147,40 +147,420 @@ LANG = {
 }
 
 HELP_SECTIONS: dict[str, tuple[str, str]] = {
-    "home": ("📚 Help Menu", "Select any category button below."),
-    "admin": ("👮 ADMIN", "/adminlist /promote /demote /setgtitle /setgpic /setgdesc /admincache"),
-    "antiflood": ("🌊 ANTIFLOOD", "/flood on|off  /setfloodmode <mute|ban|kick|delete> /clearflood on|off /antiraid on|off"),
-    "approval": ("✅ APPROVAL", "/approve /unapprove /approved"),
-    "bans": ("🔨 BANS", "/ban /sban /dban /tban /unban /kickme /kick /dkick /skick"),
-    "blocklist": ("🚫 BLOCKLIST", "/blocklist /addblock /unblock /blocklistmode <action>"),
-    "captcha": ("🧩 CAPTCHA", "/captcha on|off"),
-    "cleancmd": ("🧹 CLEAN COMMAND", "/cleancommands on|off /cleanfor <cmd> on|off"),
-    "disabling": ("⛔ DISABLING", "/disable /enable /disabled"),
-    "cleanservice": ("🧼 CLEAN SERVICE", "/cleanservice on|off"),
-    "federation": ("🌐 FEDERATION", "/newfed /subfed /joinfed /fedinfo /fban /unfban /delfed /renamefed /transferfed /myfeds"),
-    "connection": ("🔌 CONNECTION", "/connection"),
-    "filters": ("🔎 FILTERS", "/filter /stop /filters"),
-    "formatting": ("✍️ FORMATTING", "/formatting"),
-    "greetings": ("👋 GREETINGS", "/setwelcome /resetwelcome /welcome on|off /setgoodbye /resetgoodbye /goodbye on|off"),
-    "language": ("🈯 LANGUAGE", "/language en|hi"),
-    "locks": ("🔐 LOCKS", "/lock /unlock"),
-    "notes": ("🗒 NOTES", "/setnote /get /delnote"),
-    "pin": ("📌 PIN", "/pin /unpin"),
-    "logchannels": ("📡 LOGCHANNELS", "/setlogchannel /logchannel"),
-    "privacy": ("🔏 PRIVACY", "Use /owner in PM for privacy/config details."),
-    "privacydata": ("📦 PRIVACY DATA", "/ddata /deldata (private-chat only)"),
-    "purges": ("🗑 PURGES", "/purge"),
-    "reports": ("🚨 REPORTS", "/report"),
-    "rules": ("📜 RULES", "/setrules /rules"),
-    "topic": ("🧵 TOPIC", "Topic tools placeholder (extend as needed)."),
-    "warning": ("⚠️ WARNING", "/warn /dwarn /warns /resetwarns /unwarn"),
-    "silent": ("🤫 SILENT POWER", "/smute /sban /skick /dmute /dwarn"),
-    "importexport": ("📤 IMPORT/EXPORT", "/exportdata /importdata <json>"),
-    "mics": ("🎙 MICS", "/mics on|off"),
-    "extra": ("✨ EXTRA", "/id /info /reload /utag /atag /admins /del"),
-    "bio": ("🧬 BIO CHECK", "Bio check module placeholder (extend as needed)."),
-    "antiabuse": ("🛡 ANTIABUSE", "Anti-abuse module placeholder (extend as needed)."),
-    "all": ("📖 ALL", "/start /help /owner /adminlist /promote /demote /flood /approve /ban /kick /warn /cleancommands /cleanservice /filter /formatting /language /lock /setnote /pin /purge /report /rules /captcha /fban"),
+    "home": (
+        "📚 Help Menu",
+        (
+            "Welcome to the help menu!\n\n"
+            "Select a category below to learn about the available commands.\n\n"
+            "If you're new, start with the **ALL** section to see all commands at once.\n"
+        
+        )
+    ),
+    "admin": (
+        "👮 ADMIN",
+        (
+            "Make it easy to promote and demote users with the admin module!\n\n"
+            "Admin commands:\n"
+            "- `/promote <reply/username/mention/userid>`: Promote a user.\n"
+            "- `/demote <reply/username/mention/userid>`: Demote a user.\n"
+            "- `/adminlist`: List the admins in the current chat.\n"
+            "- `/admincache`: Update the admin cache, to take into account new admins/admin permissions.\n"
+            "- `/anonadmin`: Open a menu to allow or disallow anonymous admins to use all commands without checking their permissions. (Not recommended.)\n"
+            "- `/setgtitle`, `/setgpic`, `/setgdesc`: Change group title, photo, or description.\n\n"
+            "Sometimes, you promote or demote an admin manually, and the bot doesn't realise it immediately. "
+            "This is because, to avoid spamming Telegram servers, admin status is cached locally. "
+            "That means you may have to wait a few minutes for admin rights to update. "
+            "If you want to update them immediately, you can use the `/admincache` command; that'll force the bot to check who the admins are again."
+        )
+    ),
+    "antiflood": (
+        "🌊 ANTIFLOOD",
+        (
+            "Keep your chat clean from spammers with antiflood!\n\n"
+            "Commands:\n"
+            "- `/floodcontrol`: Show current flood control settings and toggle on/off.\n"
+            "- `/setfloodmode <mute|ban|kick|tban|tmute> [duration]`: Set the action for flood offenders.\n"
+            "- `/setfloodtimer <count> <seconds>`: Enable timer‑based flood (e.g., 5 messages in 10 seconds). Use `off` to disable.\n"
+            "- `/clearflood`: Toggle automatic deletion of flood messages.\n"
+            "- `/antiraid`: Open a menu to enable/configure raid protection.\n"
+            "- `/autoantiraid`: Set up automatic raid detection based on join speed.\n\n"
+            "Flood control helps prevent message spam. You can choose between consecutive messages or a timed window."
+        )
+    ),
+    "approval": (
+        "✅ APPROVAL",
+        (
+            "Manage users who are exempt from certain restrictions.\n\n"
+            "Commands:\n"
+            "- `/approve <reply/username/mention/userid>`: Add a user to the approved list.\n"
+            "- `/unapprove <reply/username/mention/userid>`: Remove a user from the approved list.\n"
+            "- `/unapproveall`: Remove all approved users (owner only).\n"
+            "- `/approved`: List all approved users.\n"
+            "- `/approval`: Check approval status of a user.\n\n"
+            "Approved users bypass locks, flood control, and night mode restrictions."
+        )
+    ),
+    "bans": (
+        "🔨 BANS",
+        (
+            "Powerful tools to remove unwanted members.\n\n"
+            "Commands:\n"
+            "- `/ban <reply/username/mention/userid>`: Ban a user.\n"
+            "- `/dban`: Delete the replied message and ban the user.\n"
+            "- `/sban`: Silently ban a user (no notification).\n"
+            "- `/tban <duration>`: Temporarily ban a user (e.g., `/tban 2h`).\n"
+            "- `/unban <reply/username/mention/userid>`: Unban a user.\n"
+            "- `/kick`: Kick a user (they can rejoin).\n"
+            "- `/dkick`: Delete the replied message and kick the user.\n"
+            "- `/skick`: Silently kick a user.\n"
+            "- `/kickme`: Leave the group yourself (the command sender)."
+        )
+    ),
+    "blocklist": (
+        "🚫 BLOCKLIST",
+        (
+            "Automatically delete messages containing blacklisted words.\n\n"
+            "Commands:\n"
+            "- `/blocklist`: List all blocked words.\n"
+            "- `/addblock <word>`: Add a word to the blocklist.\n"
+            "- `/unblock <word>`: Remove a word from the blocklist.\n"
+            "- `/blocklistmode <action>`: Set action (delete, warn, mute, etc.) when a blocked word is used.\n\n"
+            "Note: This module is currently under development; some commands may not be fully implemented."
+        )
+    ),
+    "captcha": (
+        "🧩 CAPTCHA",
+        (
+            "Verify new users with a simple CAPTCHA.\n\n"
+            "Commands:\n"
+            "- `/captcha on|off`: Enable or disable the CAPTCHA system.\n\n"
+            "When enabled, new members will receive a CAPTCHA button and must solve it to gain speaking rights."
+        )
+    ),
+    "cleancmd": (
+        "🧹 CLEAN COMMAND",
+        (
+            "Automatically delete command messages to keep chats tidy.\n\n"
+            "Commands:\n"
+            "- `/cleancommands on|off`: Toggle automatic deletion of all command messages.\n"
+            "- `/cleanfor <command> on|off`: Enable/disable deletion for a specific command (e.g., `/cleanfor ban on`)."
+        )
+    ),
+    "disabling": (
+        "⛔ DISABLING",
+        (
+            "Disable commands that you don't want regular users to use.\n\n"
+            "Commands:\n"
+            "- `/disable <command>`: Disable a command in this group.\n"
+            "- `/enable <command>`: Enable a previously disabled command.\n"
+            "- `/disabled`: List all disabled commands.\n\n"
+            "Disabled commands will still work for admins."
+        )
+    ),
+    "cleanservice": (
+        "🧼 CLEAN SERVICE",
+        (
+            "Remove service messages (e.g., \"User joined\") automatically.\n\n"
+            "Commands:\n"
+            "- `/cleanservice on|off`: Toggle cleaning of service messages."
+        )
+    ),
+    "federation": (
+        "🌐 FEDERATION",
+        (
+            "Connect multiple groups to share bans and settings.\n\n"
+            "Commands:\n"
+            "- `/newfed <name>`: Create a new federation (PM only).\n"
+            "- `/joinfed <fed_id>`: Connect this group to a federation (group owner).\n"
+            "- `/leavefed`: Disconnect this group from its federation.\n"
+            "- `/fedinfo [fed_id]`: Show federation details.\n"
+            "- `/fban <user>`: Ban a user from the whole federation.\n"
+            "- `/unfban <user>`: Remove a federation ban.\n"
+            "- `/fedstat [user] [fed_id]`: Show federation ban info.\n"
+            "- `/subfed <fed_id>`: Subscribe your federation to another (fed owner).\n"
+            "- `/myfeds`: List federations you own or admin.\n"
+            "- `/delfed`: Delete your federation (PM only).\n"
+            "- `/renamefed <new_name>`: Rename your federation.\n"
+            "- `/transferfed <user>`: Transfer federation ownership.\n"
+            "- `/fpromote <user>`: Add a federation admin.\n"
+            "- `/fdemote <user>`: Remove a federation admin.\n"
+            "- `/quietfed`: Toggle quiet mode – silently remove fed-banned users.\n\n"
+            "Federations allow you to enforce bans across multiple groups at once."
+        )
+    ),
+    "connection": (
+        "🔌 CONNECTION",
+        (
+            "See which federation and log channel this chat is connected to.\n\n"
+            "Commands:\n"
+            "- `/connection`: Display the current chat's federation and log channel (if any)."
+        )
+    ),
+    "filters": (
+        "🔎 FILTERS",
+        (
+            "Create automatic replies to keywords.\n\n"
+            "Commands:\n"
+            "- `/filter <keyword> <reply text>` or reply to a message: Save a filter.\n"
+            "- `/stop <keyword>`: Delete a filter.\n"
+            "- `/filters`: List all filters in this chat.\n\n"
+            "Filters can be text, stickers, photos, or other media. They work by whole‑word matching in messages, usernames, and full names."
+        )
+    ),
+    "formatting": (
+        "✍️ FORMATTING",
+        (
+            "Learn how to use HTML formatting in your messages.\n\n"
+            "Supported tags:\n"
+            "- `<b>bold</b>`\n"
+            "- `<i>italic</i>`\n"
+            "- `<code>code</code>`\n"
+            "- `<a href='url'>link</a>`\n\n"
+            "Use these in filter replies, welcome messages, notes, and rules."
+        )
+    ),
+    "greetings": (
+        "👋 GREETINGS",
+        (
+            "Set custom welcome and goodbye messages.\n\n"
+            "Commands:\n"
+            "- `/setwelcome <text>` or reply to a message: Set welcome message.\n"
+            "- `/resetwelcome`: Reset welcome to default.\n"
+            "- `/welcome on|off`: Toggle welcome messages.\n"
+            "- `/setgoodbye <text>` or reply: Set goodbye message.\n"
+            "- `/resetgoodbye`: Reset goodbye to default.\n"
+            "- `/goodbye on|off`: Toggle goodbye messages.\n\n"
+            "Use placeholders: `{firstname}`, `{fullname}`, `{username}`, `{mention}`, `{id}`, `{date}`, `{time}`."
+        )
+    ),
+    "language": (
+        "🈯 LANGUAGE",
+        (
+            "Change the bot's language (currently only English).\n\n"
+            "Commands:\n"
+            "- `/language en` – English only.\n\n"
+            "More languages may be added in the future."
+        )
+    ),
+    "locks": (
+        "🔐 LOCKS",
+        (
+            "Prevent specific types of messages from being sent.\n\n"
+            "Commands:\n"
+            "- `/lock <type>`: Lock a message type (media, sticker, gif, voice, poll, link, emoji, text, all).\n"
+            "- `/unlock <type>`: Unlock a message type.\n"
+            "- `lock all` and `unlock all` to lock/unlock everything.\n\n"
+            "Approved users and admins bypass locks."
+        )
+    ),
+    "notes": (
+        "🗒 NOTES",
+        (
+            "Store and retrieve notes for later use.\n\n"
+            "Commands:\n"
+            "- `/setnote <name> <content>`: Create or edit a note.\n"
+            "- `/get <name>`: Retrieve a note.\n"
+            "- `/delnote <name>`: Delete a note.\n\n"
+            "Notes can contain HTML formatting."
+        )
+    ),
+    "pin": (
+        "📌 PIN",
+        (
+            "Pin important messages with ease.\n\n"
+            "Commands:\n"
+            "- `/pin <reply>`: Pin the replied message (notify members).\n"
+            "- `/spin <reply>`: Pin silently (no notification).\n"
+            "- `/unpin <reply>`: Unpin the replied message.\n"
+            "- `/unpinall`: Unpin all pinned messages (confirmation required).\n"
+            "- `/pinned`: Show the currently pinned message.\n"
+            "- `/permapin <text>`: Send and pin a permanent message (replaces channel pins automatically)."
+        )
+    ),
+    "logchannels": (
+        "📡 LOGCHANNELS",
+        (
+            "**Log important actions to a separate channel.**\n\n"
+            "**Commands:**\n"
+            "- `/setlogchannel <chat_id>`: Set a log channel for this group.\n"
+            "- `/logchannel`: Show the current log channel."
+        )
+    ),
+    "privacy": (
+        "🔏 PRIVACY",
+        (
+            "**Your privacy is important.**\n\n"
+            "The bot stores minimal data necessary for its functions (user IDs, chat settings, warns, etc.). "
+            "No private messages are stored unless explicitly sent as commands. Data is not shared with third parties. "
+            "For full details, contact the bot owner in PM using `/owner`."
+        )
+    ),
+    "privacydata": (
+        "📦 PRIVACY DATA",
+        (
+            "**Manage your personal data.**\n\n"
+            "**Commands:**\n"
+            "- `/ddata`: Download your data stored by the bot (private chat only).\n"
+            "- `/deldata`: Delete your data from the bot's database (private chat only)."
+        )
+    ),
+    "purges": (
+        "🗑 PURGES",
+        (
+            "**Quickly delete multiple messages.**\n\n"
+            "**Commands:**\n"
+            "- `/purge <reply>`: Delete all messages from the replied message to this command.\n"
+            "- `/spurge <reply>`: Delete all messages and delete the command silently.\n"
+            "- `/purge <amount>`: Delete the last `<amount>` messages.\n"
+            "- `/purgeuser <reply>`: Delete all messages from that user between the replied message and this command.\n"
+            "- `/purgebots <reply>`: Delete all bot messages between two points.\n"
+            "- `/purgemedia <reply>`: Delete all media messages.\n"
+            "- `/purgelinks <reply>`: Delete all messages containing links.\n"
+            "- `/fastpurge <reply>`: Use batch deletion for faster purging.\n"
+            "- `/cancelpurge`: Stop an ongoing purge (if any)."
+        )
+    ),
+    "reports": (
+        "🚨 REPORTS",
+        (
+            "**Report messages to admins easily.**\n\n"
+            "**Commands:**\n"
+            "- `/report` or `@admins` in reply to a message: Notify admins.\n\n"
+            "The report is sent to the group with a mention of all admins."
+        )
+    ),
+    "rules": (
+        "📜 RULES",
+        (
+            "**Set and display group rules.**\n\n"
+            "**Commands:**\n"
+            "- `/setrules <text>` or reply to a message: Set the rules.\n"
+            "- `/rules`: Get a link to the rules (in group) or view them (in PM)."
+        )
+    ),
+    "topic": (
+        "🧵 TOPIC",
+        (
+            "**Topic management (placeholder – not yet implemented).**\n\n"
+            "Future commands for managing topics in supergroups will appear here."
+        )
+    ),
+    "warning": (
+        "⚠️ WARNING",
+        (
+            "**Warn users who break the rules.**\n\n"
+            "**Commands:**\n"
+            "- `/warn <user> [reason]`: Warn a user.\n"
+            "- `/dwarn`: Warn and delete the replied message.\n"
+            "- `/swarn`: Silently warn (no public message).\n"
+            "- `/warns <user>`: Show warnings for a user.\n"
+            "- `/resetwarns <user>`: Reset all warnings for a user.\n"
+            "- `/unwarn <user>`: Remove the latest warning.\n"
+            "- `/resetallwarns`: Reset all warns in the group (owner only).\n"
+            "- `/warnmode`: Configure the action when warn limit is reached (ban, mute, kick, tban, tmute).\n"
+            "- `/warntime <duration>`: Set warn expiry time.\n"
+            "- `/warninfo <user>`: Show detailed warn info.\n\n"
+            "You can also use `/warnings` to view current warn settings."
+        )
+    ),
+    "silent": (
+        "🤫 SILENT POWER",
+        (
+            "**Silent moderation actions (no public messages).**\n\n"
+            "**Commands:**\n"
+            "- `/smute`: Silently mute a user.\n"
+            "- `/sban`: Silently ban a user.\n"
+            "- `/skick`: Silently kick a user.\n"
+            "- `/dmute`: Delete the replied message and mute the user.\n"
+            "- `/dwarn`: Delete the replied message and warn the user.\n\n"
+            "These commands are useful when you don't want to draw attention to your actions."
+        )
+    ),
+    "importexport": (
+        "📤 IMPORT/EXPORT",
+        (
+            "**Back up and restore your data.**\n\n"
+            "**Commands:**\n"
+            "- `/exportdata`: Download all data for this chat (filters, notes, etc.) as JSON.\n"
+            "- `/importdata <json>`: Import data from a JSON backup.\n\n"
+            "Note: This feature may be limited or require owner permissions."
+        )
+    ),
+    "mics": (
+        "🎙 MICS",
+        (
+            "**Voice chat management (placeholder).**\n\n"
+            "**Commands:**\n"
+            "- `/mics on|off`: Enable/disable voice chat notifications.\n\n"
+            "More voice chat commands may be added in the future."
+        )
+    ),
+    "extra": (
+        "✨ EXTRA",
+        (
+            "**Useful utilities.**\n\n"
+            "**Commands:**\n"
+            "- `/id [user]`: Get chat or user ID.\n"
+            "- `/info [user]`: Get detailed information about a user.\n"
+            "- `/reload`: Reload runtime caches (admin only).\n"
+            "- `/utag <message>`: Mention all members (slow).\n"
+            "- `/atag <message>`: Mention all admins.\n"
+            "- `/cancel`: Stop an ongoing tag.\n"
+            "- `/admins`: List all admins (non‑admins can use this to report).\n"
+            "- `/del <reply>`: Delete the replied message (admin only)."
+        )
+    ),
+    "bio": (
+        "🧬 BIO CHECK",
+        (
+            "**Automatically detect and warn users with links in their bio.**\n\n"
+            "**Commands:**\n"
+            "- `/bioconfig`: Configure the bio filter (warn limit, action).\n"
+            "- `/allow <user>`: Whitelist a user from bio checks.\n"
+            "- `/unallow <user>`: Remove from whitelist.\n"
+            "- `/aplist`: List whitelisted users.\n\n"
+            "When enabled, the bot will delete messages from users who have links in their bio or send links, and give warnings until they are muted/banned."
+        )
+    ),
+    "antiabuse": (
+        "🛡 ANTIABUSE",
+        (
+            "**Protect your group from abuse.**\n\n"
+            "**Features:**\n"
+            "- **Antiflood** – stops message spammers.\n"
+            "- **Antiraid** – blocks mass joining.\n"
+            "- **Antichannel Pin** – restores manually pinned messages when a channel pins.\n"
+            "- **Clean Linked Channel** – deletes messages from linked channels.\n\n"
+            "All these features have their own commands (see the respective sections)."
+        )
+    ),
+    "all": (
+        "📖 ALL",
+        (
+            "**Complete list of commands**\n\n"
+            "Use the categories above to see detailed information.\n\n"
+            "**Quick reference:**\n"
+            "`/start` – Start the bot\n"
+            "`/help` – This menu\n"
+            "`/owner` – Contact the bot owner\n"
+            "`/adminlist`, `/promote`, `/demote` – Admin management\n"
+            "`/floodcontrol`, `/antiraid` – Flood/raid prevention\n"
+            "`/approve`, `/unapprove` – Approval system\n"
+            "`/ban`, `/unban`, `/kick`, `/mute`, `/unmute` – Ban/kick/mute\n"
+            "`/warn`, `/resetwarns`, `/warnmode` – Warning system\n"
+            "`/filter`, `/stop`, `/filters` – Filters\n"
+            "`/setnote`, `/get`, `/delnote` – Notes\n"
+            "`/setwelcome`, `/setgoodbye` – Greetings\n"
+            "`/lock`, `/unlock` – Locks\n"
+            "`/pin`, `/unpin`, `/permapin` – Pinning\n"
+            "`/purge`, `/purgeuser` – Purges\n"
+            "`/report`, `/admins` – Reporting\n"
+            "`/setrules`, `/rules` – Rules\n"
+            "`/captcha` – CAPTCHA verification\n"
+            "`/fban`, `/joinfed`, `/newfed` – Federation bans\n"
+            "For a complete list, explore the categories above."
+        )
+    ),
 }
 
 # --- Helper functions for keyboards ---
