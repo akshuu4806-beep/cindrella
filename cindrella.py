@@ -380,8 +380,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "logchannels": (
         "📡 LOGCHANNELS",
         (
-            "**Log important actions to a separate channel.**\n\n"
-            "**Commands:**\n"
+            "Log important actions to a separate channel.\n\n"
+            "Commands:\n"
             "- `/setlogchannel <chat_id>`: Set a log channel for this group.\n"
             "- `/logchannel`: Show the current log channel."
         )
@@ -389,7 +389,7 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "privacy": (
         "🔏 PRIVACY",
         (
-            "**Your privacy is important.**\n\n"
+            "Your privacy is important.\n\n"
             "The bot stores minimal data necessary for its functions (user IDs, chat settings, warns, etc.). "
             "No private messages are stored unless explicitly sent as commands. Data is not shared with third parties. "
             "For full details, contact the bot owner in PM using `/owner`."
@@ -398,8 +398,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "privacydata": (
         "📦 PRIVACY DATA",
         (
-            "**Manage your personal data.**\n\n"
-            "**Commands:**\n"
+            "Manage your personal data.\n\n"
+            "Commands:\n"
             "- `/ddata`: Download your data stored by the bot (private chat only).\n"
             "- `/deldata`: Delete your data from the bot's database (private chat only)."
         )
@@ -407,8 +407,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "purges": (
         "🗑 PURGES",
         (
-            "**Quickly delete multiple messages.**\n\n"
-            "**Commands:**\n"
+            "Quickly delete multiple messages.\n\n"
+            "Commands:\n"
             "- `/purge <reply>`: Delete all messages from the replied message to this command.\n"
             "- `/spurge <reply>`: Delete all messages and delete the command silently.\n"
             "- `/purge <amount>`: Delete the last `<amount>` messages.\n"
@@ -423,8 +423,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "reports": (
         "🚨 REPORTS",
         (
-            "**Report messages to admins easily.**\n\n"
-            "**Commands:**\n"
+            "Report messages to admins easily.\n\n"
+            "Commands:\n"
             "- `/report` or `@admins` in reply to a message: Notify admins.\n\n"
             "The report is sent to the group with a mention of all admins."
         )
@@ -432,8 +432,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "rules": (
         "📜 RULES",
         (
-            "**Set and display group rules.**\n\n"
-            "**Commands:**\n"
+            "Set and display group rules.\n\n"
+            "Commands:\n"
             "- `/setrules <text>` or reply to a message: Set the rules.\n"
             "- `/rules`: Get a link to the rules (in group) or view them (in PM)."
         )
@@ -441,15 +441,15 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "topic": (
         "🧵 TOPIC",
         (
-            "**Topic management (placeholder – not yet implemented).**\n\n"
+            "Topic management (placeholder – not yet implemented).\n\n"
             "Future commands for managing topics in supergroups will appear here."
         )
     ),
     "warning": (
         "⚠️ WARNING",
         (
-            "**Warn users who break the rules.**\n\n"
-            "**Commands:**\n"
+            "Warn users who break the rules.\n\n"
+            "Commands:\n"
             "- `/warn <user> [reason]`: Warn a user.\n"
             "- `/dwarn`: Warn and delete the replied message.\n"
             "- `/swarn`: Silently warn (no public message).\n"
@@ -466,8 +466,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "silent": (
         "🤫 SILENT POWER",
         (
-            "**Silent moderation actions (no public messages).**\n\n"
-            "**Commands:**\n"
+            "Silent moderation actions (no public messages).\n\n"
+            "Commands:\n"
             "- `/smute`: Silently mute a user.\n"
             "- `/sban`: Silently ban a user.\n"
             "- `/skick`: Silently kick a user.\n"
@@ -479,8 +479,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "importexport": (
         "📤 IMPORT/EXPORT",
         (
-            "**Back up and restore your data.**\n\n"
-            "**Commands:**\n"
+            "Back up and restore your data.\n\n"
+            "Commands:\n"
             "- `/exportdata`: Download all data for this chat (filters, notes, etc.) as JSON.\n"
             "- `/importdata <json>`: Import data from a JSON backup.\n\n"
             "Note: This feature may be limited or require owner permissions."
@@ -489,8 +489,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "mics": (
         "🎙 MICS",
         (
-            "**Voice chat management (placeholder).**\n\n"
-            "**Commands:**\n"
+            "Voice chat management (placeholder).\n\n"
+            "Commands:\n"
             "- `/mics on|off`: Enable/disable voice chat notifications.\n\n"
             "More voice chat commands may be added in the future."
         )
@@ -498,8 +498,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "extra": (
         "✨ EXTRA",
         (
-            "**Useful utilities.**\n\n"
-            "**Commands:**\n"
+            "Useful utilities.\n\n"
+            "Commands:\n"
             "- `/id [user]`: Get chat or user ID.\n"
             "- `/info [user]`: Get detailed information about a user.\n"
             "- `/reload`: Reload runtime caches (admin only).\n"
@@ -513,8 +513,8 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "bio": (
         "🧬 BIO CHECK",
         (
-            "**Automatically detect and warn users with links in their bio.**\n\n"
-            "**Commands:**\n"
+            "Automatically detect and warn users with links in their bio.\n\n"
+            "Commands:\n"
             "- `/bioconfig`: Configure the bio filter (warn limit, action).\n"
             "- `/allow <user>`: Whitelist a user from bio checks.\n"
             "- `/unallow <user>`: Remove from whitelist.\n"
@@ -525,21 +525,21 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
     "antiabuse": (
         "🛡 ANTIABUSE",
         (
-            "**Protect your group from abuse.**\n\n"
-            "**Features:**\n"
-            "- **Antiflood** – stops message spammers.\n"
-            "- **Antiraid** – blocks mass joining.\n"
-            "- **Antichannel Pin** – restores manually pinned messages when a channel pins.\n"
-            "- **Clean Linked Channel** – deletes messages from linked channels.\n\n"
+            "Protect your group from abuse.\n\n"
+            "Features:\n"
+            "- Antiflood – stops message spammers.\n"
+            "- Antiraid – blocks mass joining.\n"
+            "- Antichannel Pin – restores manually pinned messages when a channel pins.\n"
+            "- Clean Linked Channel – deletes messages from linked channels.\n\n"
             "All these features have their own commands (see the respective sections)."
         )
     ),
     "all": (
         "📖 ALL",
         (
-            "**Complete list of commands**\n\n"
+            "Complete list of commands\n\n"
             "Use the categories above to see detailed information.\n\n"
-            "**Quick reference:**\n"
+            "Quick reference:\n"
             "`/start` – Start the bot\n"
             "`/help` – This menu\n"
             "`/owner` – Contact the bot owner\n"
