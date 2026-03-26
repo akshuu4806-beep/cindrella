@@ -71,7 +71,7 @@ bio_allowlist_col = mongo_db["bio_allowlist"]
 bio_warns_col = mongo_db["bio_warns"]
 system_info_col = mongo_db["system_info"]
 permapin_messages_col = mongo_db["permapin_messages"]
-
+autoantiraid_joins: dict[int, deque] = defaultdict(deque)
 # --- Link detection regex ---
 import re
 
@@ -139,7 +139,7 @@ pending_warnmode = {}  # key: session_id, value: {chat_id, user_id, action, dura
 # --- Language support (English only now, but structure kept for future) ---
 LANG = {
     "en": {
-        "admin_only": "Admin only command.",
+        "admin_only": "You need to be an admin to do this..",
         "reloaded": "Reloaded runtime caches.",
         "lang_set": "Language updated.",
         "tag_none": "No active users cached yet.",
@@ -237,6 +237,26 @@ def get_filter_data(message: Message):
     return None
 
 # --- MongoDB e functions ---
+# --- Autoantiraid & antiraid punish settings ---
+async def get_autoantiraid_threshold(chat_id: int) -> int:
+    return int(await get_chat_setting(chat_id, "autoantiraid_threshold", "0"))
+
+async def set_autoantiraid_threshold(chat_id: int, threshold: int):
+    await set_chat_setting(chat_id, "autoantiraid_threshold", str(threshold))
+
+async def get_antiraid_punish_action(chat_id: int) -> str:
+    return await get_chat_setting(chat_id, "antiraid_punish_action", "mute")
+
+async def set_antiraid_punish_action(chat_id: int, action: str):
+    await set_chat_setting(chat_id, "antiraid_punish_action", action)
+
+async def get_antiraid_punish_duration(chat_id: int) -> int:
+    return int(await get_chat_setting(chat_id, "antiraid_punish_duration", "0"))
+
+async def set_antiraid_punish_duration(chat_id: int, duration: int):
+    await set_chat_setting(chat_id, "antiraid_punish_duration", str(duration))
+
+
 async def get_antiraid_enabled(chat_id: int) -> bool:
     return await get_chat_setting(chat_id, "antiraid_enabled", "0") == "1"
 
@@ -380,7 +400,7 @@ async def get_flood_mode(chat_id: int) -> tuple[str, dict]:
         window = FLOOD_WINDOW   # global constant
         return "consecutive", {"limit": limit, "window": window}
 
-def get_floodcontrol_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+def get_flood_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     """Build the flood control inline keyboard based on current state."""
     enable_text = "✅ Enable" if enabled else "Enable"
     disable_text = "Disable" if enabled else "❌ Disable"
@@ -428,7 +448,7 @@ def build_number_pad_warnmode(current_duration: str) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(rows)
 
-def get_floodcontrol_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+def get_flood_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     """Build the flood control inline keyboard based on current state."""
     enable_text = "✅ Enable" if enabled else "Enable"
     disable_text = "Disable" if enabled else "❌ Disable"
@@ -858,7 +878,7 @@ async def require_admin(client: Client, message: Message, user_id: int = None) -
     if OWNER_ID and user_id == OWNER_ID:
         return True
     if not await is_admin(client, message, user_id):
-        await message.reply_text("Admin only command.")
+        await message.reply_text("You need to be an admin to do this..")
         return False
     return True
 
@@ -1135,7 +1155,7 @@ async def can_manage_filters(client: Client, message: Message, admin_id: int = N
         return True
 
     if not await is_admin(client, message, user_id):
-        await message.reply_text("Admin only command.")
+        await message.reply_text("You need to be an admin to do this..")
         return False
 
     member = await client.get_chat_member(message.chat.id, user_id)
@@ -1587,17 +1607,68 @@ async def on_new_members(client: Client, message: Message) -> None:
         if member.is_bot:
             continue
 
-        # 1. ALWAYS check fedban before anything else
+        # 1. Fedban check
         banned = await check_and_punish_fedbanned_user(client, chat_id, member.id, message)
         if banned:
-            # User was banned, skip everything (welcome, etc.)
             continue
 
-        # 2. Only after fedban check, handle welcome if enabled
+        # --- AUTOANTIRAID TRACKING ---
+        threshold = await get_autoantiraid_threshold(chat_id)
+        if threshold > 0:
+            now = time.time()
+            join_queue = autoantiraid_joins[chat_id]
+            join_queue.append((now, member.id))
+
+            # Remove entries older than 60 seconds
+            while join_queue and now - join_queue[0][0] > 60:
+                join_queue.popleft()
+
+            # Check if threshold reached
+            if len(join_queue) >= threshold:
+                # Get the punishment action
+                action = await get_antiraid_punish_action(chat_id)
+                # We'll use duration 0 (permanent) for now
+                punished_users = []
+                for ts, uid in list(join_queue):
+                    if await is_admin(client, message, uid) or await is_approved(chat_id, uid):
+                        continue
+                    try:
+                        if action == "mute":
+                            await client.restrict_chat_member(chat_id, uid, ChatPermissions(can_send_messages=False))
+                        elif action == "kick":
+                            await client.ban_chat_member(chat_id, uid)
+                            await client.unban_chat_member(chat_id, uid)
+                        elif action == "ban":
+                            await client.ban_chat_member(chat_id, uid)
+                        punished_users.append(uid)
+                    except Exception as e:
+                        print(f"Autoantiraid punish failed for {uid}: {e}")
+
+                # Clear the queue to avoid re-punishing
+                join_queue.clear()
+
+                # Send notification
+                if punished_users:
+                    await client.send_message(
+                        chat_id,
+                        f"🚨 **Autoantiraid triggered!**\n"
+                        f"{len(punished_users)} users were {action}ed for joining too fast.\n"
+                        f"Threshold: {threshold} joins/minute.",
+                        parse_mode=enums.ParseMode.MARKDOWN
+                    )
+                else:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ Autoantiraid threshold reached but no users could be punished (all were admins or approved).",
+                        parse_mode=enums.ParseMode.MARKDOWN
+                    )
+
+        # 2. Welcome message
         settings = await get_chat_settings(chat_id)
         if settings.get("welcome_enabled", False):
             welcome_data = settings.get("welcome", {})
             await send_welcome_goodbye(client, chat_id, member, welcome_data, reply_to_message_id=message.id)
+
 
 async def on_left_member(client: Client, event):
     if isinstance(event, Message):
@@ -4691,7 +4762,7 @@ async def admincache(client: Client, message: Message, verified=False, admin_id:
     await set_last_admincache(chat_id, now)
     await message.reply_text(f"Admin cache refreshed: {len(admins)} admins")
 
-async def floodcontrol_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
+async def flood_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
@@ -4704,13 +4775,13 @@ async def floodcontrol_cmd(client: Client, message: Message, verified=False, adm
     # Anonymous admin detection (unchanged)
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
-            return await floodcontrol_cmd(client, message, verified=True, admin_id=0)
+            return await flood_cmd(client, message, verified=True, admin_id=0)
         else:
             action_id = str(uuid.uuid4())
             pending_admin_actions[action_id] = {
                 "chat_id": message.chat.id,
                 "message": message,
-                "action": "floodcontrol",
+                "action": "flood",
                 "time": time.time(),
                 "used": False
             }
@@ -4751,7 +4822,7 @@ async def floodcontrol_cmd(client: Client, message: Message, verified=False, adm
             "This chat is not currently enforcing flood control."
         )
 
-    keyboard = get_floodcontrol_keyboard(enabled)
+    keyboard = get_flood_keyboard(enabled)
     await message.reply_text(status_text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
 
 async def setfloodtimer_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
@@ -8605,6 +8676,74 @@ async def disabled_cmd_guard(client: Client, message: Message) -> None:
             await message.reply_text("This command is disabled in this chat.")
         message.stop_propagation()
 
+async def autoantiraid_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
+
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+
+    # Anonymous admin detection
+    if not verified and message.from_user is None and message.sender_chat:
+        if await get_anonadmin_enabled(message.chat.id):
+            return await autoantiraid_cmd(client, message, verified=True, admin_id=0)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_admin_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "action": "autoantiraid",
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+            ]])
+            await message.reply_text(
+                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+                reply_markup=keyboard
+            )
+            return
+
+    if not (verified and message.from_user is None):
+        if not await require_admin(client, message):
+            return
+        # Permission check: need change info (like antiraid)
+        user_id = admin_id if admin_id else message.from_user.id
+        if not await user_has_permission(client, message.chat.id, user_id, "can_change_info"):
+            await message.reply_text("❌ You need 'Change Group Info' permission.")
+            return
+
+    await show_autoantiraid_menu(client, message, message.chat.id, edit=False)
+
+async def show_autoantiraid_menu(client, source, chat_id, edit=True):
+    threshold = await get_autoantiraid_threshold(chat_id)
+
+    status = "✅ Enabled" if threshold > 0 else "❌ Disabled"
+    text = (
+        f"**⚙️ Autoantiraid Settings**\n\n"
+        f"Status: {status}\n"
+        f"Threshold: {threshold} joins per minute\n\n"
+        f"When enabled, if {threshold} or more users join within 60 seconds, "
+        f"all those users will be punished using the action selected in antiraid's punish menu."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Enable", callback_data=f"autoantiraid:enable:{chat_id}"),
+         InlineKeyboardButton("Disable", callback_data=f"autoantiraid:disable:{chat_id}")],
+        [InlineKeyboardButton(f"🔢 Set Threshold ({threshold})", callback_data=f"autoantiraid:set_threshold:{chat_id}")],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+
+    if edit and hasattr(source, 'edit_message_text'):
+        try:
+            await source.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        except MessageNotModified:
+            pass
+    else:
+        await source.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+
 async def antiraid_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     """Manage antiraid settings via inline menu."""
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -9924,6 +10063,9 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
     elif command == "antiraid":
         await antiraid_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
+    elif command == "autoantiraid":
+        await autoantiraid_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    
     elif command == "setnote":
         await setnote(client, msg, verified=True, admin_id=callback_query.from_user.id)
     
@@ -9978,8 +10120,8 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
     elif command == "quietfed":
         await quietfed_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
-    elif command == "floodcontrol":
-        await floodcontrol_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    elif command == "flood":
+        await flood_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "setfloodmode":
         await setfloodmode_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
@@ -10269,7 +10411,7 @@ async def quietfed_callback(client: Client, callback_query: CallbackQuery):
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
-async def floodcontrol_callback(client: Client, callback_query: CallbackQuery):
+async def flood_callback(client: Client, callback_query: CallbackQuery):
     q = callback_query
     await q.answer()
     if not await is_admin(client, q.message, q.from_user.id):
@@ -10321,7 +10463,7 @@ async def floodcontrol_callback(client: Client, callback_query: CallbackQuery):
             "This chat is not currently enforcing flood control."
         )
 
-    keyboard = get_floodcontrol_keyboard(enabled)
+    keyboard = get_flood_keyboard(enabled)
     try:
         await q.edit_message_text(f"{msg}\n\n{status_text}", reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
     except MessageNotModified:
@@ -11044,6 +11186,252 @@ async def antiraid_cancel_callback(client: Client, callback_query: CallbackQuery
     else:
         await callback_query.answer("Cancelled.", show_alert=False)
 
+async def antiraid_punish_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) < 4:
+        return
+    action_type = parts[2]  # "menu", "action", or "back"
+
+    if action_type == "menu":
+        # Format: antiraid:punish:menu:{chat_id}
+        chat_id = int(parts[3])
+    elif action_type == "action":
+        # Format: antiraid:punish:action:{action}:{chat_id}
+        if len(parts) < 5:
+            return
+        punish_action = parts[3]
+        chat_id = int(parts[4])
+    elif action_type == "back":
+        # Format: antiraid:punish:back:{chat_id}
+        chat_id = int(parts[3])
+        # Return to main antiraid menu
+        await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+        await callback_query.answer()
+        return
+    else:
+        return
+
+    user_id = callback_query.from_user.id
+
+    # Verify admin and permissions
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        if member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            await callback_query.answer("❌ You are not an admin!", show_alert=True)
+            return
+        if member.status != enums.ChatMemberStatus.OWNER:
+            if not (member.privileges and member.privileges.can_change_info):
+                await callback_query.answer("❌ You need 'Change Group Info' permission.", show_alert=True)
+                return
+            if not (member.privileges and member.privileges.can_restrict_members):
+                await callback_query.answer("❌ You need 'Ban Members' permission.", show_alert=True)
+                return
+    except Exception:
+        await callback_query.answer("❌ Failed to verify admin status.", show_alert=True)
+        return
+
+    if action_type == "menu":
+        # Show punishment selection menu
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔇 Mute", callback_data=f"antiraid:punish:action:mute:{chat_id}"),
+             InlineKeyboardButton("👢 Kick", callback_data=f"antiraid:punish:action:kick:{chat_id}")],
+            [InlineKeyboardButton("🚫 Ban", callback_data=f"antiraid:punish:action:ban:{chat_id}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"antiraid:punish:back:{chat_id}")]
+        ])
+        await callback_query.edit_message_text(
+            "Select the punishment for raiding users:",
+            reply_markup=keyboard,
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+        await callback_query.answer()
+        return
+
+    elif action_type == "action":
+        punish_action = parts[3]
+        await set_antiraid_punish_action(chat_id, punish_action)
+        # Set duration to 0 (permanent) for now
+        await set_antiraid_punish_duration(chat_id, 0)
+        await callback_query.answer(f"✅ Punishment set to {punish_action.upper()}", show_alert=False)
+        # Refresh main antiraid menu
+        await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+        return
+
+pending_autoantiraid_actions = {}   # session_id -> {chat_id, user_id, message_id, threshold_str}
+
+async def autoantiraid_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+    action = parts[1]
+    chat_id = int(parts[2])
+    user_id = callback_query.from_user.id
+
+    # Verify admin
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        if member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            await callback_query.answer("❌ You are not an admin!", show_alert=True)
+            return
+        if member.status != enums.ChatMemberStatus.OWNER:
+            if not (member.privileges and member.privileges.can_change_info):
+                await callback_query.answer("❌ You need 'Change Group Info' permission.", show_alert=True)
+                return
+    except Exception:
+        await callback_query.answer("❌ Failed to verify admin status.", show_alert=True)
+        return
+
+    if action == "enable":
+        # Enable requires a threshold > 0. If threshold is 0, we need to ask for it.
+        threshold = await get_autoantiraid_threshold(chat_id)
+        if threshold == 0:
+            await callback_query.answer("Please set a threshold first using 'Set Threshold'.", show_alert=True)
+            return
+        # Otherwise, enable is already on? Actually threshold >0 means enabled.
+        await callback_query.answer("Autoantiraid is already enabled when threshold > 0.", show_alert=True)
+        await show_autoantiraid_menu(client, callback_query, chat_id, edit=True)
+        return
+
+    elif action == "disable":
+        await set_autoantiraid_threshold(chat_id, 0)
+        await callback_query.answer("❌ Autoantiraid disabled.", show_alert=False)
+        await show_autoantiraid_menu(client, callback_query, chat_id, edit=True)
+        return
+
+    elif action == "set_threshold":
+        session_id = str(uuid.uuid4())
+        pending_autoantiraid_actions[session_id] = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "message_id": callback_query.message.id,
+            "threshold_str": ""
+        }
+        # Show number pad
+        keyboard = build_number_pad_autoantiraid(session_id, "")
+        await callback_query.edit_message_text(
+            "🔢 **Set Autoantiraid Threshold**\n\nEnter the number of joins per minute (max 999):\n\nCurrent: 0",
+            reply_markup=keyboard,
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+        await callback_query.answer()
+        return
+
+def build_number_pad_autoantiraid(session_id: str, current: str) -> InlineKeyboardMarkup:
+    """Build number pad for autoantiraid threshold entry."""
+    rows = []
+    for i in range(1, 10, 3):
+        row = []
+        for j in range(3):
+            digit = str(i + j)
+            row.append(InlineKeyboardButton(digit, callback_data=f"autoantiraid_digit:{session_id}:{digit}"))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("0", callback_data=f"autoantiraid_digit:{session_id}:0"),
+        InlineKeyboardButton("⌫ Clear", callback_data=f"autoantiraid_clear:{session_id}")
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Back", callback_data=f"autoantiraid_back:{session_id}"),
+        InlineKeyboardButton("✅ OK", callback_data=f"autoantiraid_ok:{session_id}")
+    ])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"autoantiraid_cancel:{session_id}")])
+    return InlineKeyboardMarkup(rows)
+
+async def autoantiraid_digit_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    session_id = parts[1]
+    digit = parts[2]
+    session = pending_autoantiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+
+    new_str = session["threshold_str"] + digit
+    if len(new_str) > 3:   # limit to 3 digits
+        await callback_query.answer("Maximum 3 digits allowed.", show_alert=True)
+        return
+    session["threshold_str"] = new_str
+    keyboard = build_number_pad_autoantiraid(session_id, new_str)
+    await callback_query.edit_message_text(
+        f"🔢 **Set Autoantiraid Threshold**\n\nEnter the number of joins per minute (max 999):\n\nCurrent: {new_str or '0'}",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    await callback_query.answer()
+
+async def autoantiraid_clear_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_autoantiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+    session["threshold_str"] = ""
+    keyboard = build_number_pad_autoantiraid(session_id, "")
+    await callback_query.edit_message_text(
+        "🔢 **Set Autoantiraid Threshold**\n\nEnter the number of joins per minute (max 999):\n\nCurrent: 0",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    await callback_query.answer()
+
+async def autoantiraid_ok_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_autoantiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+
+    threshold_str = session["threshold_str"]
+    if not threshold_str or int(threshold_str) == 0:
+        await callback_query.answer("Threshold must be a positive number.", show_alert=True)
+        return
+    threshold = int(threshold_str)
+    if threshold > 999:
+        await callback_query.answer("Threshold cannot exceed 999.", show_alert=True)
+        return
+
+    await set_autoantiraid_threshold(session["chat_id"], threshold)
+    await callback_query.answer(f"✅ Threshold set to {threshold}", show_alert=False)
+    del pending_autoantiraid_actions[session_id]
+    await show_autoantiraid_menu(client, callback_query, session["chat_id"], edit=True)
+
+async def autoantiraid_back_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_autoantiraid_actions.get(session_id)
+    if session and session["user_id"] == callback_query.from_user.id:
+        del pending_autoantiraid_actions[session_id]
+        await show_autoantiraid_menu(client, callback_query, session["chat_id"], edit=True)
+    else:
+        await callback_query.answer("Cancelled.", show_alert=False)
+
+async def autoantiraid_cancel_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_autoantiraid_actions.get(session_id)
+    if session and session["user_id"] == callback_query.from_user.id:
+        del pending_autoantiraid_actions[session_id]
+        await show_autoantiraid_menu(client, callback_query, session["chat_id"], edit=True)
+    else:
+        await callback_query.answer("Cancelled.", show_alert=False)
+
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
@@ -11061,11 +11449,11 @@ def main():
         "unmute": unmute, "ban": ban, "sban": sban, "tban": tban, "dban": dban, "unban": unban,
         "kick": kick, "dkick": dkick, "skick": skick, "kickme": kickme, "lock": lock, "unlock": unlock,
         "pin": pin_message, "unpin": unpin_message, "cleanservice": cleanservice, "cleancommands": clean_cmd_toggle,
-        "cleanfor": clean_cmd_for, "captcha": captcha_toggle, "floodcontrol": floodcontrol_cmd, "setfloodtimer": setfloodtimer_cmd,
+        "cleanfor": clean_cmd_for, "captcha": captcha_toggle, "flood": flood_cmd, "setfloodtimer": setfloodtimer_cmd,
         "setfloodmode": setfloodmode_cmd, "clearflood": clearflood, "approve": approve, "unapprove": unapprove,"unapproveall": unapproveall,
         "approved": approved, "approval": approval,"adminlist": adminlist, "promote": promote, "demote": demote,
         "setgtitle": setgtitle, "resetgtitle": resetgtitle, "setgpic": setgpic, "delgpic": delgpic, "setgdesc": setgdesc, "delgdesc": delgdesc,
-        "admincache": admincache, "id": id_cmd, "info": info, "purge": purge, "report": report,
+        "admincache": admincache, "id": id_cmd, "info": info, "purge": purge, "report": report, "autoantiraid": autoantiraid_cmd,
         "admins": admins_cmd, "del": del_message, "pinned": pinned_cmd, "spin": spin_message, "unpinall": unpinall_message, "permapin": permapin_command,
         "formatting": formatting, "fpromote": federation_admin_manager, "fdemote": federation_admin_manager,"leavefed" :leavefed_cmd, "chatfed": chatfed_cmd, "quietfed": quietfed_cmd,
         "setvcmsg": set_vc_msg, "vcmsg": vcmsg_toggle, "setvcinvite": set_vc_invite, "vcinvite": vcinvite_toggle, "fedadmins": fedadmins_cmd, "fedstat": fedstat_cmd,
@@ -11085,7 +11473,8 @@ def main():
     }
 
     # Final COMMAND_HANDLERS dictionary
-    COMMAND_HANDLERS = {**commands, **multi_word_commands}
+    COMMAND_HANDLERS = {**commands, **multi_word_commands, "autoantiraid": autoantiraid_cmd}
+
 
     for name, fn in commands.items():
         app.add_handler(MessageHandler(fn, filters.command(name)))
@@ -11120,7 +11509,7 @@ def main():
     app.add_handler(CallbackQueryHandler(join_fed_callback, filters.regex(r"^joinfed:")))
     app.add_handler(CallbackQueryHandler(leavefed_callback, filters.regex(r"^leavefed:")))
     app.add_handler(CallbackQueryHandler(quietfed_callback, filters.regex(r"^quietfed:")))
-    app.add_handler(CallbackQueryHandler(floodcontrol_callback, filters.regex(r"^flood_")))
+    app.add_handler(CallbackQueryHandler(flood_callback, filters.regex(r"^flood_")))
     app.add_handler(CallbackQueryHandler(setfloodmode_action_callback, filters.regex(r"^setfloodmode_action:")))
     app.add_handler(CallbackQueryHandler(setfloodmode_duration_callback, filters.regex(r"^floodmode_")))
     app.add_handler(CallbackQueryHandler(clearflood_callback, filters.regex(r"^clearflood:")))
@@ -11131,12 +11520,20 @@ def main():
     app.add_handler(CallbackQueryHandler(nightmode_hour_callback, filters.regex(r"^nightmode_hour:")))
     app.add_handler(CallbackQueryHandler(nightmode_ampm_callback, filters.regex(r"^nightmode_ampm:")))
     app.add_handler(CallbackQueryHandler(nightmode_cancel_callback, filters.regex(r"^nightmode_cancel:")))
+    app.add_handler(CallbackQueryHandler(antiraid_punish_callback, filters.regex(r"^antiraid:punish:")))
     app.add_handler(CallbackQueryHandler(antiraid_callback, filters.regex(r"^antiraid:")))
     app.add_handler(CallbackQueryHandler(antiraid_digit_callback, filters.regex(r"^antiraid_digit:")))
     app.add_handler(CallbackQueryHandler(antiraid_clear_callback, filters.regex(r"^antiraid_clear:")))
     app.add_handler(CallbackQueryHandler(antiraid_unit_callback, filters.regex(r"^antiraid_unit:")))
     app.add_handler(CallbackQueryHandler(antiraid_back_callback, filters.regex(r"^antiraid_back:")))
     app.add_handler(CallbackQueryHandler(antiraid_cancel_callback, filters.regex(r"^antiraid_cancel:")))
+    app.add_handler(CallbackQueryHandler(autoantiraid_callback, filters.regex(r"^autoantiraid:")))
+    app.add_handler(CallbackQueryHandler(autoantiraid_digit_callback, filters.regex(r"^autoantiraid_digit:")))
+    app.add_handler(CallbackQueryHandler(autoantiraid_clear_callback, filters.regex(r"^autoantiraid_clear:")))
+    app.add_handler(CallbackQueryHandler(autoantiraid_ok_callback, filters.regex(r"^autoantiraid_ok:")))
+    app.add_handler(CallbackQueryHandler(autoantiraid_back_callback, filters.regex(r"^autoantiraid_back:")))
+    app.add_handler(CallbackQueryHandler(autoantiraid_cancel_callback, filters.regex(r"^autoantiraid_cancel:")))
+
     
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
