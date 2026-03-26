@@ -72,6 +72,9 @@ bio_warns_col = mongo_db["bio_warns"]
 system_info_col = mongo_db["system_info"]
 permapin_messages_col = mongo_db["permapin_messages"]
 autoantiraid_joins: dict[int, deque] = defaultdict(deque)
+ # --- Owner & Sudo collections ---
+sudo_users_col = mongo_db["sudo_users"]
+active_chats_col = mongo_db["active_chats"]
 # --- Link detection regex ---
 import re
 
@@ -127,6 +130,8 @@ pending_antiraid_actions = {}
 pending_floodmode = {}  # key: unique_id, value: {chat_id, user_id, action, duration_str, message_id}
 active_tagging = {}
 purge_running = {}
+# --- Broadcast tracking ---
+pending_broadcast = {}  # key: user_id, value: {text, media, pin, mode}
 FLOOD_WINDOW_SEC = 7
 FLOOD_LIMIT = 6
 FLOOD_WINDOW = 10          # seconds
@@ -617,6 +622,32 @@ def get_filter_data(message: Message):
     return None
 
 # --- MongoDB e functions ---
+# --- Helper for owner/sudo permissions ---
+async def is_owner_or_sudo(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    doc = await sudo_users_col.find_one({"user_id": user_id})
+    return doc is not None
+
+async def get_chat_link(client: Client, chat) -> str:
+    """Generate a clickable link for a chat."""
+    if isinstance(chat, int):
+        chat = await client.get_chat(chat)
+    if chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        if chat.username:
+            return f"https://t.me/{chat.username}"
+        else:
+            # Try to get an invite link (bot must be admin with can_invite_users)
+            try:
+                invite = await client.export_chat_invite_link(chat.id)
+                return invite
+            except:
+                return f"tg://openchat?chat_id={chat.id}"
+    elif chat.type == enums.ChatType.PRIVATE:
+        return f"tg://user?id={chat.id}"
+    else:
+        return "No link available"
+
 # --- Autoantiraid & antiraid punish settings ---
 async def get_autoantiraid_threshold(chat_id: int) -> int:
     return int(await get_chat_setting(chat_id, "autoantiraid_threshold", "0"))
@@ -1488,6 +1519,200 @@ async def owner_group(client: Client, message: Message):
 
     except Exception as e:
         await message.reply_text(f"Error: {e}")
+
+# -------------------- Owner & Sudo Commands --------------------
+async def chats_cmd(client: Client, message: Message):
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+    chats = await active_chats_col.find().sort("last_activity", -1).to_list(length=None)
+    if not chats:
+        return await message.reply_text("No active chats found.")
+    reply = "**Active Chats (Group + DM)**\n\n"
+    for idx, chat in enumerate(chats, start=1):
+        chat_id = chat["chat_id"]
+        title = chat.get("title", "Unknown")
+        chat_type = chat["type"]
+        emoji = "👥" if chat_type in ["group", "supergroup"] else "👤"
+        reply += f"{idx}. {emoji} {title} (`{chat_id}`)\n"
+    await message.reply_text(reply, parse_mode=enums.ParseMode.MARKDOWN)
+
+async def pchats_cmd(client: Client, message: Message):
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+    chats = await active_chats_col.find({"type": "private"}).sort("last_activity", -1).to_list(length=None)
+    if not chats:
+        return await message.reply_text("No active private chats found.")
+    reply = "**Active Private Chats**\n\n"
+    for idx, chat in enumerate(chats, start=1):
+        chat_id = chat["chat_id"]
+        title = chat.get("title", "Unknown")
+        reply += f"{idx}. {title} (`{chat_id}`)\n"
+    await message.reply_text(reply, parse_mode=enums.ParseMode.MARKDOWN)
+
+async def gchats_cmd(client: Client, message: Message):
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+    chats = await active_chats_col.find({"type": {"$in": ["group", "supergroup"]}}).sort("last_activity", -1).to_list(length=None)
+    if not chats:
+        return await message.reply_text("No active groups found.")
+    reply = "**Active Groups**\n\n"
+    for idx, chat in enumerate(chats, start=1):
+        chat_id = chat["chat_id"]
+        title = chat.get("title", "Unknown")
+        reply += f"{idx}. 👥 {title} (`{chat_id}`)\n"
+    await message.reply_text(reply, parse_mode=enums.ParseMode.MARKDOWN)
+
+async def getlink_cmd(client: Client, message: Message):
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+    args = get_args(message)
+    if not args:
+        return await message.reply_text("Usage: /getlink <serial_number>")
+    try:
+        sn = int(args[0])
+    except:
+        return await message.reply_text("Invalid serial number.")
+    chats = await active_chats_col.find().sort("last_activity", -1).to_list(length=None)
+    if sn < 1 or sn > len(chats):
+        return await message.reply_text("Serial number out of range.")
+    chat_data = chats[sn-1]
+    chat_id = chat_data["chat_id"]
+    chat = await client.get_chat(chat_id)
+    link = await get_chat_link(client, chat)
+    await message.reply_text(f"**Link for {chat_data.get('title', 'Unknown')}**\n{link}")
+
+async def broadcast_cmd(client: Client, message: Message, pin=False, mode="all"):
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+    reply = message.reply_to_message
+    args = get_args(message)
+    if not reply and not args:
+        return await message.reply_text("Reply to a message or provide text to broadcast.")
+    text = ""
+    media = None
+    if reply:
+        text = reply.text or reply.caption or ""
+        if reply.photo:
+            media = ("photo", reply.photo.file_id)
+        elif reply.video:
+            media = ("video", reply.video.file_id)
+        elif reply.document:
+            media = ("document", reply.document.file_id)
+        elif reply.animation:
+            media = ("animation", reply.animation.file_id)
+        elif reply.sticker:
+            media = ("sticker", reply.sticker.file_id)
+    else:
+        text = " ".join(args)
+    # Store in pending
+    pending_broadcast[message.from_user.id] = {
+        "text": text,
+        "media": media,
+        "pin": pin,
+        "mode": mode,
+        "message": message
+    }
+    # Send confirmation keyboard
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm Broadcast", callback_data=f"broadcast_confirm:{message.from_user.id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"broadcast_cancel:{message.from_user.id}")]
+    ])
+    await message.reply_text("⚠️ You are about to broadcast to all active chats. Confirm?", reply_markup=keyboard)
+
+async def gcast_cmd(client: Client, message: Message):
+    await broadcast_cmd(client, message, pin=False, mode="group")
+
+async def pcast_cmd(client: Client, message: Message):
+    await broadcast_cmd(client, message, pin=False, mode="private")
+
+async def broadcastpin_cmd(client: Client, message: Message):
+    await broadcast_cmd(client, message, pin=True, mode="all")
+
+async def gcastpin_cmd(client: Client, message: Message):
+    await broadcast_cmd(client, message, pin=True, mode="group")
+
+async def pcastpin_cmd(client: Client, message: Message):
+    await broadcast_cmd(client, message, pin=True, mode="private")
+
+async def broadcastunpin_cmd(client: Client, message: Message, mode="all"):
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+    # Get all chats of the specified mode
+    query = {}
+    if mode == "group":
+        query["type"] = {"$in": ["group", "supergroup"]}
+    elif mode == "private":
+        query["type"] = "private"
+    chats = await active_chats_col.find(query).to_list(length=None)
+    if not chats:
+        return await message.reply_text("No active chats found for the selected mode.")
+    count = 0
+    for chat_data in chats:
+        chat_id = chat_data["chat_id"]
+        # Check if bot has pin permission in this chat
+        try:
+            chat = await client.get_chat(chat_id)
+            if chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+                # Try to unpin the latest pinned message
+                pinned = chat.pinned_message
+                if pinned:
+                    await client.unpin_chat_message(chat_id, pinned.id)
+                    count += 1
+        except Exception:
+            continue
+    await message.reply_text(f"Unpinned the latest message in {count} chats (only where possible).")
+
+async def gcastunpin_cmd(client: Client, message: Message):
+    await broadcastunpin_cmd(client, message, mode="group")
+
+async def pcastunpin_cmd(client: Client, message: Message):
+    await broadcastunpin_cmd(client, message, mode="private")
+
+async def add_sudo(client: Client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can manage sudo users.")
+    target = await get_target_user(client, message)
+    if not target:
+        return await message.reply_text("User not found.")
+    user_id = target.id
+    if user_id == OWNER_ID:
+        return await message.reply_text("The owner is already sudo.")
+    existing = await sudo_users_col.find_one({"user_id": user_id})
+    if existing:
+        return await message.reply_text("User is already a sudo user.")
+    await sudo_users_col.insert_one({"user_id": user_id})
+    await message.reply_text(f"✅ {target.mention} added as sudo user.")
+
+async def rm_sudo(client: Client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can manage sudo users.")
+    target = await get_target_user(client, message)
+    if not target:
+        return await message.reply_text("User not found.")
+    user_id = target.id
+    if user_id == OWNER_ID:
+        return await message.reply_text("The owner cannot be removed from sudo.")
+    result = await sudo_users_col.delete_one({"user_id": user_id})
+    if result.deleted_count:
+        await message.reply_text(f"❌ {target.mention} removed from sudo users.")
+    else:
+        await message.reply_text("User was not a sudo user.")
+
+async def sudo_list(client: Client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can view the sudo list.")
+    users = await sudo_users_col.find().to_list(length=100)
+    if not users:
+        return await message.reply_text("No sudo users.")
+    text = "**Sudo Users**\n"
+    for u in users:
+        user_id = u["user_id"]
+        try:
+            user = await client.get_users(user_id)
+            text += f"• {user.mention} (<code>{user_id}</code>)\n"
+        except:
+            text += f"• <code>{user_id}</code>\n"
+    await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
 
 async def generic_toggle(client: Client, message: Message, key: str, label: str, verified=False, admin_id: int = None) -> None:
     # Anonymous admin detection
@@ -9452,6 +9677,7 @@ async def _atag_main(client: Client, message: Message):
 
 async def track_activity(client: Client, message: Message) -> None:
     if message.from_user and not message.from_user.is_bot and message.chat:
+        # Update user activity in user_activity_col (already there)
         dq = active_users[message.chat.id]
         uid = message.from_user.id
         if uid in dq:
@@ -9461,6 +9687,19 @@ async def track_activity(client: Client, message: Message) -> None:
         await user_activity_col.update_one(
             {"chat_id": message.chat.id, "user_id": uid},
             {"$inc": {"msg_count": 1}, "$set": {"last_seen": int(time.time())}},
+            upsert=True
+        )
+
+        # --- NEW: Update active chats collection ---
+        await active_chats_col.update_one(
+            {"chat_id": message.chat.id},
+            {
+                "$set": {
+                    "title": message.chat.title or "",
+                    "type": message.chat.type.value,
+                    "last_activity": int(time.time())
+                }
+            },
             upsert=True
         )
     message.continue_propagation()
@@ -11812,6 +12051,75 @@ async def autoantiraid_cancel_callback(client: Client, callback_query: CallbackQ
     else:
         await callback_query.answer("Cancelled.", show_alert=False)
 
+async def broadcast_confirm_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    action, user_id_str = parts[0], parts[1]
+    user_id = int(user_id_str)
+    if callback_query.from_user.id != user_id:
+        return await callback_query.answer("This confirmation is not for you.", show_alert=True)
+    if action == "broadcast_confirm":
+        data = pending_broadcast.pop(user_id, None)
+        if not data:
+            return await callback_query.answer("Broadcast data not found.", show_alert=True)
+        text = data["text"]
+        media = data["media"]
+        pin = data["pin"]
+        mode = data["mode"]
+        # Determine which chats to broadcast to
+        query = {}
+        if mode == "group":
+            query["type"] = {"$in": ["group", "supergroup"]}
+        elif mode == "private":
+            query["type"] = "private"
+        # else "all" – no filter
+        chats = await active_chats_col.find(query).to_list(length=None)
+        if not chats:
+            await callback_query.edit_message_text("No active chats found for broadcast.")
+            return
+        sent_count = 0
+        pinned_count = 0
+        for chat_data in chats:
+            chat_id = chat_data["chat_id"]
+            try:
+                if media:
+                    mtype, fid = media
+                    if mtype == "photo":
+                        msg = await client.send_photo(chat_id, fid, caption=text, parse_mode=enums.ParseMode.HTML)
+                    elif mtype == "video":
+                        msg = await client.send_video(chat_id, fid, caption=text, parse_mode=enums.ParseMode.HTML)
+                    elif mtype == "document":
+                        msg = await client.send_document(chat_id, fid, caption=text, parse_mode=enums.ParseMode.HTML)
+                    elif mtype == "animation":
+                        msg = await client.send_animation(chat_id, fid, caption=text, parse_mode=enums.ParseMode.HTML)
+                    elif mtype == "sticker":
+                        msg = await client.send_sticker(chat_id, fid)
+                        if text:
+                            await client.send_message(chat_id, text, parse_mode=enums.ParseMode.HTML)
+                    else:
+                        msg = await client.send_message(chat_id, text, parse_mode=enums.ParseMode.HTML)
+                else:
+                    msg = await client.send_message(chat_id, text, parse_mode=enums.ParseMode.HTML)
+                sent_count += 1
+                if pin and chat_data["type"] in ("group", "supergroup"):
+                    # Try to pin
+                    try:
+                        await msg.pin(disable_notification=True)
+                        pinned_count += 1
+                    except:
+                        pass
+            except Exception as e:
+                print(f"Failed to send to {chat_id}: {e}")
+        await callback_query.edit_message_text(
+            f"Broadcast completed.\nSent to {sent_count} chats.\nPinned in {pinned_count} groups (where possible)."
+        )
+    elif action == "broadcast_cancel":
+        pending_broadcast.pop(user_id, None)
+        await callback_query.edit_message_text("❌ Broadcast cancelled.")
+    await callback_query.answer()
+
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
@@ -11844,6 +12152,22 @@ def main():
         "fbanlist": fban_list, "feddemoteme": feddemoteme, "bioconfig": bioconfig_cmd, "allow": allow_bio_user,
         "unallow": unallow_bio_user, "aplist": aplist_bio, "filter": filter_cmd_handler, "stop": stop_filter_handler,
         "filters": list_filters_handler,"antichannelpin": antichannelpin_command,"cleanlinked": cleanlinked_command, "anonadmin": anonadmin_command,
+        "chats": chats_cmd,
+        "pchats": pchats_cmd,
+        "getlink": getlink_cmd,
+        "broadcast": broadcast_cmd,
+        "gcast": gcast_cmd,
+        "pcast": pcast_cmd,
+        "broadcastpin": broadcastpin_cmd,
+        "gcastpin": gcastpin_cmd,
+        "pcastpin": pcastpin_cmd,
+        "broadcastunpin": broadcastunpin_cmd,
+        "gcastunpin": gcastunpin_cmd,
+        "pcastunpin": pcastunpin_cmd,
+        "addsudo": add_sudo,
+        "rmsudo": rm_sudo,
+        "sudolist": sudo_list,
+        "gchats": gchats_cmd,
     }
 
     # Multi-word commands (exact match)
@@ -11913,7 +12237,7 @@ def main():
     app.add_handler(CallbackQueryHandler(autoantiraid_ok_callback, filters.regex(r"^autoantiraid_ok:")))
     app.add_handler(CallbackQueryHandler(autoantiraid_back_callback, filters.regex(r"^autoantiraid_back:")))
     app.add_handler(CallbackQueryHandler(autoantiraid_cancel_callback, filters.regex(r"^autoantiraid_cancel:")))
-
+    app.add_handler(CallbackQueryHandler(broadcast_confirm_callback, filters.regex(r"^(broadcast_confirm|broadcast_cancel):")))
     
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
