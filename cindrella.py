@@ -123,6 +123,7 @@ PENDING_ACTION_TIMEOUT = 300  # 5 minutes
 ANONYMOUS_ADMIN_ID = 1087968824
 # --- Global tracking structures ---
 pending_nightmode = {}
+pending_antiraid_actions = {}
 pending_floodmode = {}  # key: unique_id, value: {chat_id, user_id, action, duration_str, message_id}
 active_tagging = {}
 purge_running = {}
@@ -236,6 +237,45 @@ def get_filter_data(message: Message):
     return None
 
 # --- MongoDB e functions ---
+async def get_antiraid_enabled(chat_id: int) -> bool:
+    return await get_chat_setting(chat_id, "antiraid_enabled", "0") == "1"
+
+async def set_antiraid_enabled(chat_id: int, enabled: bool):
+    await set_chat_setting(chat_id, "antiraid_enabled", to_bool_str(enabled))
+
+async def get_antiraid_duration(chat_id: int) -> int:
+    return int(await get_chat_setting(chat_id, "antiraid_duration", "0"))
+
+async def set_antiraid_duration(chat_id: int, seconds: int):
+    await set_chat_setting(chat_id, "antiraid_duration", str(seconds))
+
+async def get_antiraid_expiry(chat_id: int) -> int:
+    return int(await get_chat_setting(chat_id, "antiraid_expiry", "0"))
+
+async def set_antiraid_expiry(chat_id: int, timestamp: int):
+    await set_chat_setting(chat_id, "antiraid_expiry", str(timestamp))
+
+
+async def expire_antiraid_loop():
+    """Periodically disable antiraid when the duration expires."""
+    while True:
+        try:
+            now = int(time.time())
+            async for doc in chat_settings_col.find({"antiraid_enabled": "1", "antiraid_expiry": {"$ne": "0"}}):
+                chat_id = doc["chat_id"]
+                expiry = int(doc.get("antiraid_expiry", "0"))
+                if expiry > 0 and now >= expiry:
+                    await set_antiraid_enabled(chat_id, False)
+                    await set_antiraid_expiry(chat_id, 0)
+                    try:
+                        await client.send_message(chat_id, "🛡 Antiraid mode has been automatically disabled after the set duration.")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Antiraid expiry loop error: {e}")
+        await asyncio.sleep(60)
+
+
 def is_night_time(start_str: str, end_str: str) -> bool:
     """Return True if current time (Kolkata) is within the given window."""
     def parse_time(t: str):
@@ -8565,20 +8605,19 @@ async def disabled_cmd_guard(client: Client, message: Message) -> None:
             await message.reply_text("This command is disabled in this chat.")
         message.stop_propagation()
 
-async def antiraid(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    # Only groups allowed
+async def antiraid_cmd(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
+    """Manage antiraid settings via inline menu."""
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
         return
-    
-    # --- NEW: Bot must be admin and have restrict members permission ---
+
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
 
     # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
-            return await antiraid(client, message, verified=True, admin_id=0)
+            return await antiraid_cmd(client, message, verified=True, admin_id=0)
         else:
             action_id = str(uuid.uuid4())
             pending_admin_actions[action_id] = {
@@ -8597,18 +8636,69 @@ async def antiraid(client: Client, message: Message, verified=False, admin_id: i
             )
             return
 
-    # Admin check for non‑verified or regular admins
+    # Permission checks for normal (non‑anonymous) admins
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
+        user_id = message.from_user.id
+        if not await user_has_permission(client, message.chat.id, user_id, "can_change_info"):
+            await message.reply_text("❌ You need 'Change Group Info' permission to manage antiraid.")
+            return
+        if not await user_has_permission(client, message.chat.id, user_id, "can_restrict_members"):
+            await message.reply_text("❌ You need 'Ban Members' permission to manage antiraid.")
+            return
+    elif verified and admin_id is not None and admin_id != 0:
+        # Proven admin with a real user ID
+        if not await user_has_permission(client, message.chat.id, admin_id, "can_change_info"):
+            await message.reply_text("❌ You need 'Change Group Info' permission to manage antiraid.")
+            return
+        if not await user_has_permission(client, message.chat.id, admin_id, "can_restrict_members"):
+            await message.reply_text("❌ You need 'Ban Members' permission to manage antiraid.")
+            return
+    # Verified anonymous admin (admin_id == 0) → skip permission checks
 
-    args = get_args(message)
-    if not args or args[0].lower() not in {"on", "off"}:
-        await message.reply_text("Usage: /antiraid on|off")
-        return
-    enabled = args[0].lower() == "on"
-    await set_chat_setting(message.chat.id, "antiraid_enabled", to_bool_str(enabled))
-    await message.reply_text(f"Antiraid {'enabled' if enabled else 'disabled'}.")
+    await show_antiraid_menu(client, message, message.chat.id, edit=False)
+
+async def show_antiraid_menu(client, source, chat_id, edit=True):
+    """Display the antiraid settings inline keyboard."""
+    enabled = await get_antiraid_enabled(chat_id)
+    duration = await get_antiraid_duration(chat_id)
+    expiry = await get_antiraid_expiry(chat_id)
+    now = int(time.time())
+    if enabled and expiry > now:
+        status_text = f"✅ **Enabled** (expires in {format_duration(expiry - now)})"
+    elif enabled:
+        status_text = "✅ **Enabled** (no expiry)"
+    else:
+        status_text = "❌ **Disabled**"
+
+    enable_text = "Enable" if not enabled else "🟢 Enable"
+    disable_text = "🔴 Disable" if not enabled else "Disable"
+    duration_text = format_duration(duration) if duration else "Not set"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(enable_text, callback_data=f"antiraid:enable:{chat_id}"),
+         InlineKeyboardButton(disable_text, callback_data=f"antiraid:disable:{chat_id}")],
+        [InlineKeyboardButton(f"⏱ Set Duration ({duration_text})", callback_data=f"antiraid:set_duration:{chat_id}")],
+        [InlineKeyboardButton("❌ Close", callback_data="del_msg")]
+    ])
+
+    text = (
+        f"**🛡 Antiraid Settings**\n\n"
+        f"Status: {status_text}\n"
+        f"Duration: {duration_text}\n\n"
+        f"When enabled, suspected raids will be handled automatically.\n"
+        f"Use the Set Duration button to specify how long antiraid should stay active."
+    )
+
+    if edit and hasattr(source, 'edit_message_text'):
+        try:
+            await source.edit_message_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        except MessageNotModified:
+            pass  # Ignore if the message content is identical
+    else:
+        await source.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+        
 
 async def connection(client: Client, message: Message) -> None:
     fed = await get_fed(message.chat.id)
@@ -9832,7 +9922,7 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
         await enable_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "antiraid":
-        await antiraid(client, msg, verified=True, admin_id=callback_query.from_user.id)
+        await antiraid_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
     elif command == "setnote":
         await setnote(client, msg, verified=True, admin_id=callback_query.from_user.id)
@@ -10715,7 +10805,244 @@ async def refresh_nightmode_menu(client, callback_query, chat_id):
     except MessageNotModified:
         pass
 
+async def antiraid_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+    action = parts[1]
+    chat_id = int(parts[2])
+    user_id = callback_query.from_user.id
 
+    # Verify admin and required permissions
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        if member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            await callback_query.answer("❌ You are not an admin!", show_alert=True)
+            return
+        if member.status != enums.ChatMemberStatus.OWNER:
+            if not (member.privileges and member.privileges.can_change_info):
+                await callback_query.answer("❌ You need 'Change Group Info' permission.", show_alert=True)
+                return
+            if not (member.privileges and member.privileges.can_restrict_members):
+                await callback_query.answer("❌ You need 'Ban Members' permission.", show_alert=True)
+                return
+    except Exception:
+        await callback_query.answer("❌ Failed to verify admin status.", show_alert=True)
+        return
+
+    if action == "enable":
+        # Check if duration is zero
+        duration = await get_antiraid_duration(chat_id)
+        if duration == 0:
+            await callback_query.answer(
+                "❌ Cannot enable antiraid because duration is set to 0.\n"
+                "Please set a positive duration first using 'Set Duration'.",
+                show_alert=True
+            )
+            return
+        await set_antiraid_enabled(chat_id, True)
+        duration = await get_antiraid_duration(chat_id)
+        if duration > 0:
+            await set_antiraid_expiry(chat_id, int(time.time()) + duration)
+        else:
+            await set_antiraid_expiry(chat_id, 0)
+        await callback_query.answer("✅ Antiraid enabled.", show_alert=False)
+        await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+
+    elif action == "disable":
+        await set_antiraid_enabled(chat_id, False)
+        await set_antiraid_expiry(chat_id, 0)
+        await callback_query.answer("❌ Antiraid disabled.", show_alert=False)
+        await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+
+    elif action == "set_duration":
+        session_id = str(uuid.uuid4())
+        pending_antiraid_actions[session_id] = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "message_id": callback_query.message.id,
+            "duration_str": "",
+            "unit": None
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(1, 4)],
+            [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(4, 7)],
+            [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(7, 10)],
+            [InlineKeyboardButton("0", callback_data=f"antiraid_digit:{session_id}:0")],
+            [InlineKeyboardButton("⌫ Clear", callback_data=f"antiraid_clear:{session_id}")],
+            [InlineKeyboardButton("Sec", callback_data=f"antiraid_unit:{session_id}:sec"),
+             InlineKeyboardButton("Min", callback_data=f"antiraid_unit:{session_id}:min"),
+             InlineKeyboardButton("Hour", callback_data=f"antiraid_unit:{session_id}:hour")],
+            [InlineKeyboardButton("Day", callback_data=f"antiraid_unit:{session_id}:day"),
+             InlineKeyboardButton("Week", callback_data=f"antiraid_unit:{session_id}:week")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"antiraid_back:{session_id}"),
+             InlineKeyboardButton("❌ Cancel", callback_data=f"antiraid_cancel:{session_id}")]
+        ])
+        await callback_query.edit_message_text(
+            "⏱ **Set Antiraid Duration**\n\nEnter the number, then select a unit.\nCurrent: 0",
+            reply_markup=keyboard,
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+        await callback_query.answer()
+
+async def antiraid_digit_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    session_id = parts[1]
+    digit = parts[2]
+    session = pending_antiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+
+    # If the current duration string is empty and the digit is "0", immediately disable antiraid
+    if not session["duration_str"] and digit == "0":
+        chat_id = session["chat_id"]
+        # Set duration to 0
+        await set_antiraid_duration(chat_id, 0)
+        # Disable antiraid
+        await set_antiraid_enabled(chat_id, False)
+        await set_antiraid_expiry(chat_id, 0)
+        # Remove the session
+        del pending_antiraid_actions[session_id]
+        # Show the main menu
+        await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+        await callback_query.answer("⚠️ Antiraid disabled (duration set to 0).", show_alert=False)
+        return
+
+    # Otherwise, add the digit to the string
+    session["duration_str"] += digit
+    # Update the message with the new current value
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(1, 4)],
+        [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(4, 7)],
+        [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(7, 10)],
+        [InlineKeyboardButton("0", callback_data=f"antiraid_digit:{session_id}:0")],
+        [InlineKeyboardButton("⌫ Clear", callback_data=f"antiraid_clear:{session_id}")],
+        [InlineKeyboardButton("Sec", callback_data=f"antiraid_unit:{session_id}:sec"),
+         InlineKeyboardButton("Min", callback_data=f"antiraid_unit:{session_id}:min"),
+         InlineKeyboardButton("Hour", callback_data=f"antiraid_unit:{session_id}:hour")],
+        [InlineKeyboardButton("Day", callback_data=f"antiraid_unit:{session_id}:day"),
+         InlineKeyboardButton("Week", callback_data=f"antiraid_unit:{session_id}:week")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"antiraid_back:{session_id}"),
+         InlineKeyboardButton("❌ Cancel", callback_data=f"antiraid_cancel:{session_id}")]
+    ])
+    await callback_query.edit_message_text(
+        f"⏱ **Set Antiraid Duration**\n\nEnter the number, then select a unit.\nCurrent: {session['duration_str']}",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    await callback_query.answer()
+    
+async def antiraid_clear_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_antiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+    session["duration_str"] = ""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(1, 4)],
+        [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(4, 7)],
+        [InlineKeyboardButton(str(i), callback_data=f"antiraid_digit:{session_id}:{i}") for i in range(7, 10)],
+        [InlineKeyboardButton("0", callback_data=f"antiraid_digit:{session_id}:0")],
+        [InlineKeyboardButton("⌫ Clear", callback_data=f"antiraid_clear:{session_id}")],
+        [InlineKeyboardButton("Sec", callback_data=f"antiraid_unit:{session_id}:sec"),
+         InlineKeyboardButton("Min", callback_data=f"antiraid_unit:{session_id}:min"),
+         InlineKeyboardButton("Hour", callback_data=f"antiraid_unit:{session_id}:hour")],
+        [InlineKeyboardButton("Day", callback_data=f"antiraid_unit:{session_id}:day"),
+         InlineKeyboardButton("Week", callback_data=f"antiraid_unit:{session_id}:week")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"antiraid_back:{session_id}"),
+         InlineKeyboardButton("❌ Cancel", callback_data=f"antiraid_cancel:{session_id}")]
+    ])
+    await callback_query.edit_message_text(
+        f"⏱ **Set Antiraid Duration**\n\nEnter the number, then select a unit.\nCurrent: 0",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    await callback_query.answer()
+
+async def antiraid_unit_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    session_id = parts[1]
+    unit = parts[2]
+    session = pending_antiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+    number_str = session["duration_str"]
+    if not number_str:
+        await callback_query.answer("Please enter a number first.", show_alert=True)
+        return
+    number = int(number_str)
+    if unit == "sec":
+        seconds = number
+    elif unit == "min":
+        seconds = number * 60
+    elif unit == "hour":
+        seconds = number * 3600
+    elif unit == "day":
+        seconds = number * 86400
+    elif unit == "week":
+        seconds = number * 604800
+    else:
+        seconds = 0
+
+    chat_id = session["chat_id"]
+
+    # If seconds is 0, disable antiraid
+    if seconds == 0:
+        await set_antiraid_duration(chat_id, 0)
+        await set_antiraid_enabled(chat_id, False)
+        await set_antiraid_expiry(chat_id, 0)
+        await callback_query.answer("⚠️ Antiraid disabled because duration was set to 0.", show_alert=False)
+    else:
+        await set_antiraid_duration(chat_id, seconds)
+        if await get_antiraid_enabled(chat_id):
+            await set_antiraid_expiry(chat_id, int(time.time()) + seconds)
+        await callback_query.answer(f"✅ Duration set to {number} {unit}(s).", show_alert=False)
+
+    del pending_antiraid_actions[session_id]
+    await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+
+async def antiraid_back_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_antiraid_actions.get(session_id)
+    if not session or session["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+    chat_id = session["chat_id"]
+    del pending_antiraid_actions[session_id]
+    await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+    await callback_query.answer()
+
+async def antiraid_cancel_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    parts = data.split(":")
+    if len(parts) != 2:
+        return
+    session_id = parts[1]
+    session = pending_antiraid_actions.get(session_id)
+    if session and session["user_id"] == callback_query.from_user.id:
+        del pending_antiraid_actions[session_id]
+        chat_id = session["chat_id"]
+        await show_antiraid_menu(client, callback_query, chat_id, edit=True)
+    else:
+        await callback_query.answer("Cancelled.", show_alert=False)
 
 def main():
     app = Client("rose_clone", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
@@ -10723,7 +11050,7 @@ def main():
     # Command handlers
     commands = {
         "start": start, "clone": clone, "help": help_cmd, "reload": reload_bot, "language": language,
-        "owner": owner_group, "antiraid": antiraid, "connection": connection, "disable": disable_cmd,
+        "owner": owner_group, "antiraid": antiraid_cmd, "connection": connection, "disable": disable_cmd,
         "enable": enable_cmd, "disabled": disabled_cmds, "setlogchannel": set_log_channel,
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
         "welcome": welcome_toggle, "setgoodbye": setgoodbye, "resetgoodbye": resetgoodbye,
@@ -10804,6 +11131,12 @@ def main():
     app.add_handler(CallbackQueryHandler(nightmode_hour_callback, filters.regex(r"^nightmode_hour:")))
     app.add_handler(CallbackQueryHandler(nightmode_ampm_callback, filters.regex(r"^nightmode_ampm:")))
     app.add_handler(CallbackQueryHandler(nightmode_cancel_callback, filters.regex(r"^nightmode_cancel:")))
+    app.add_handler(CallbackQueryHandler(antiraid_callback, filters.regex(r"^antiraid:")))
+    app.add_handler(CallbackQueryHandler(antiraid_digit_callback, filters.regex(r"^antiraid_digit:")))
+    app.add_handler(CallbackQueryHandler(antiraid_clear_callback, filters.regex(r"^antiraid_clear:")))
+    app.add_handler(CallbackQueryHandler(antiraid_unit_callback, filters.regex(r"^antiraid_unit:")))
+    app.add_handler(CallbackQueryHandler(antiraid_back_callback, filters.regex(r"^antiraid_back:")))
+    app.add_handler(CallbackQueryHandler(antiraid_cancel_callback, filters.regex(r"^antiraid_cancel:")))
     
     # Group handlers
     app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
@@ -10830,6 +11163,7 @@ def main():
         asyncio.create_task(run_web())
         await permapin_messages_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
         asyncio.create_task(expire_warns_loop())
+        asyncio.create_task(expire_antiraid_loop())
         print("Bot is now online and running!")
         await idle()
         await app.stop()
