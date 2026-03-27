@@ -4881,11 +4881,11 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
         return
-    
+
     # --- NEW: Bot must be admin and have restrict members permission ---
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
-    
+
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await promote(client, message, verified=True, admin_id=0)
@@ -4937,19 +4937,48 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
     if not target:
         await message.reply_text("User not found.")
         return
+
     args = get_args(message)
     title = " ".join(args[1:]) if len(args) > 1 else None
+
+    # --- NEW: Get bot's own privileges to copy ---
+    bot_me = await client.get_me()
+    bot_member = await client.get_chat_member(message.chat.id, bot_me.id)
+    if bot_member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+        await message.reply_text("❌ I am not admin here.")
+        return
+    if not bot_member.privileges:
+        await message.reply_text("❌ I don't have any admin privileges to copy.")
+        return
+
+    # Copy all privileges except can_promote_members
+    import inspect
+    from pyrogram.types import ChatPrivileges
+    privs = bot_member.privileges
+    sig = inspect.signature(ChatPrivileges)
+    valid_params = set(sig.parameters.keys())
+    valid_params.discard('self')
+    
+    # Build dictionary with known fields
+    priv_dict = {
+        'can_manage_chat': privs.can_manage_chat,
+        'can_delete_messages': privs.can_delete_messages,
+        'can_restrict_members': privs.can_restrict_members,
+        'can_invite_users': privs.can_invite_users,
+        'can_pin_messages': privs.can_pin_messages,
+        'can_promote_members': False,
+    }
+    # Add optional fields if they exist in both bot's privileges and are accepted by ChatPrivileges
+    for attr in ['can_manage_video_chats', 'can_manage_stories']:
+        if attr in valid_params and hasattr(privs, attr):
+            priv_dict[attr] = getattr(privs, attr, False)
+    
+    new_privs = ChatPrivileges(**priv_dict)
 
     try:
         await client.promote_chat_member(
             message.chat.id, target.id,
-            privileges=ChatPrivileges(
-                can_manage_chat=True,
-                can_delete_messages=False,
-                can_restrict_members=False,
-                can_invite_users=False,
-                can_pin_messages=False
-            )
+            privileges=new_privs
         )
         if title:
             try:
@@ -4959,7 +4988,7 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text(f"Promoted! {title}")
     except Exception as e:
         await message.reply_text(f"Failed to promote: {e}")
-
+        
 async def demote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
