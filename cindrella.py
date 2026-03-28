@@ -5189,13 +5189,28 @@ async def setgdesc(client: Client, message: Message, verified=False, admin_id: i
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
 
-    args = get_args(message)
-    if not args:
-        await message.reply_text("Usage: /setgdesc <text>")
-        return
-    await client.set_chat_description(message.chat.id, " ".join(args))
-    await message.reply_text("Group description updated.")
+    # --- Determine description text ---
+    desc_text = None
+    if message.reply_to_message:
+        # If replying, take text from the replied message (or caption)
+        desc_text = message.reply_to_message.text or message.reply_to_message.caption
+        if not desc_text:
+            await message.reply_text("❌ Replied message has no text or caption.")
+            return
+    else:
+        args = get_args(message)
+        if not args:
+            await message.reply_text("Usage: /setgdesc <text> or reply to a message.")
+            return
+        desc_text = " ".join(args)
 
+    # Set the description
+    try:
+        await client.set_chat_description(message.chat.id, desc_text)
+        await message.reply_text("✅ Group description updated.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to update description: {e}")
+        
 async def delgdesc(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
