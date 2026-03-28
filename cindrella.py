@@ -1302,6 +1302,7 @@ def target_user(message: Message) -> int | None:
         return message.reply_to_message.from_user.id
     return None
 
+# ----- Update get_target_user -----
 async def get_target_user(client: Client, message: Message):
     """Extract user from reply, user ID, username, or full name mention."""
     # If reply, get that user
@@ -1312,14 +1313,24 @@ async def get_target_user(client: Client, message: Message):
     if not args:
         return None
 
-    user_input = args[0]
-    # Try to parse as user ID
+    # Join all arguments to support multi‑word names
+    user_input = " ".join(args).strip()
+
+    # Private chat: just try to get the user globally
+    if message.chat.type in (enums.ChatType.PRIVATE, enums.ChatType.BOT):
+        try:
+            return await client.get_users(user_input)
+        except Exception:
+            return None
+
+    # Try to parse as user ID (must be numeric only)
     if user_input.isdigit():
         try:
             return await client.get_users(int(user_input))
         except:
             pass
-    # Try as username (without @)
+
+    # Try as username (strip leading @)
     if user_input.startswith('@'):
         user_input = user_input[1:]
     try:
@@ -1327,11 +1338,10 @@ async def get_target_user(client: Client, message: Message):
     except:
         pass
 
-    # --- Full name matching ---
-    # Search among recently active members (from active_users cache)
+    # --- Full name matching in groups ---
     chat_id = message.chat.id
     full_name = user_input.lower().strip()
-    # Get recent user IDs from cache
+    # Search among recently active members (from active_users cache)
     recent_uids = list(active_users.get(chat_id, deque()))
     for uid in recent_uids:
         try:
@@ -5702,33 +5712,31 @@ async def clearflood(client: Client, message: Message, verified=False, admin_id:
     await message.reply_text(description, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
 
 
+# ----- Update id_cmd -----
 async def id_cmd(client: Client, message: Message) -> None:
     tid = message.chat.id
     user = None
 
     # 1. First, check if the command is a reply to another message
     if message.reply_to_message:
-        # Check if they are replying to another anonymous admin/channel
         if message.reply_to_message.sender_chat:
             txt = f"Chat ID: <code>{message.reply_to_message.sender_chat.id}</code>"
             return await message.reply_text(txt, parse_mode=enums.ParseMode.HTML)
         else:
             user = message.reply_to_message.from_user
 
-    # 2. Second, check if a username or ID was passed as an argument (e.g., /id @username)
+    # 2. Second, check if a username, ID, or full name was passed as an argument
     elif len(message.command) > 1:
-        try:
-            user = await client.get_users(message.command[1])
-        except Exception:
+        # Use get_target_user to resolve user from arguments (supports full names)
+        user = await get_target_user(client, message)
+        if not user:
             return await message.reply_text("User not found.")
 
     # 3. Third, if there is no reply and no argument, fetch the sender's own ID
     else:
-        # Check if the sender is an anonymous admin
         if message.sender_chat:
             txt = f"Chat ID: <code>{message.sender_chat.id}</code>"
             return await message.reply_text(txt, parse_mode=enums.ParseMode.HTML)
-        # Otherwise, it's a normal user
         else:
             user = message.from_user
 
@@ -5747,12 +5755,12 @@ User ID: <code>{user.id}</code>
 """
         await message.reply_text(txt, parse_mode=enums.ParseMode.HTML)
         
+# ----- Update info -----
 async def info(client: Client, message: Message) -> None:
-    user = None 
+    user = None
 
     # 1. First, check if the command is a reply to another message
     if message.reply_to_message:
-        # Check if they replied to an anonymous admin/channel
         if message.reply_to_message.sender_chat:
             chat = message.reply_to_message.sender_chat
             text = f"""
@@ -5765,16 +5773,14 @@ async def info(client: Client, message: Message) -> None:
         else:
             user = message.reply_to_message.from_user
 
-    # 2. Second, check if a username or ID was passed as an argument
+    # 2. Second, check if a username, ID, or full name was passed as an argument
     elif len(message.command) > 1:
-        try:
-            user = await client.get_users(message.command[1])
-        except Exception:
+        user = await get_target_user(client, message)
+        if not user:
             return await message.reply_text("User not found.")
 
     # 3. Third, if there is no reply and no argument, fetch the sender's own info
     else:
-        # Check if the sender is an anonymous admin
         if message.sender_chat:
             chat = message.sender_chat
             text = f"""
@@ -5784,15 +5790,12 @@ async def info(client: Client, message: Message) -> None:
 <b>Chat ID:</b> <code>{chat.id}</code>
 """
             return await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
-        # Otherwise, it's a normal user
         else:
             user = message.from_user
 
     if user:
         try:
             member = await client.get_chat_member(message.chat.id, user.id)
-            
-            # Dynamic Status Logic
             st = member.status
             if st == enums.ChatMemberStatus.OWNER:
                 status = "Owner 👑"
@@ -5853,8 +5856,8 @@ async def info(client: Client, message: Message) -> None:
         if photo:
             await message.reply_photo(photo, caption=text, parse_mode=enums.ParseMode.HTML)
         else:
-            await message.reply_text(text, parse_mode=enums.ParseMode.HTML)        
-
+            await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+            
 async def report(client: Client, message: Message) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
