@@ -7813,7 +7813,8 @@ async def vc_started(client: Client, message: Message) -> None:
 
 async def vc_ended(client: Client, message: Message) -> None:
     duration = message.video_chat_ended.duration
-    await message.reply_text(f"🔇 **Voice Chat ended.**\n⏳ Duration: {duration} seconds.")
+    formatted = format_duration(duration)   # uses the existing function
+    await message.reply_text(f"🔇 **Voice Chat ended.**\n⏳ Duration: {formatted}.")
 
 async def vc_invited(client: Client, message: Message):
     invited_users = message.video_chat_members_invited.users
