@@ -1097,7 +1097,7 @@ async def bot_is_admin(client: Client, chat_id: int) -> bool:
 
 async def get_warn_action(chat_id: int) -> str:
     """Get the action to take when warn limit is reached."""
-    return await get_chat_setting(chat_id, "warn_action", "ban")
+    return await get_chat_setting(chat_id, "warn_action", "mute")
 
 async def set_warn_action(chat_id: int, action: str) -> None:
     await set_chat_setting(chat_id, "warn_action", action)
@@ -1155,8 +1155,8 @@ async def set_rules(chat_id: int, rules_text: str) -> None:
 async def get_bio_config(chat_id: int):
     doc = await bio_config_col.find_one({"chat_id": chat_id})
     if doc:
-        return doc.get("warn_limit", 5), doc.get("action", "mute"), doc.get("enabled", False)
-    return 5, "mute", False
+        return doc.get("warn_limit", 3), doc.get("action", "mute"), doc.get("enabled", True)
+    return 3, "mute", True
 
 async def set_bio_config(chat_id: int, key: str, value):
     await bio_config_col.update_one({"chat_id": chat_id}, {"$set": {key: value}}, upsert=True)
