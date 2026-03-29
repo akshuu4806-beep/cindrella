@@ -3787,6 +3787,89 @@ async def unmute(client: Client, message: Message, verified=False, admin_id: int
     except Exception as e:
         await message.reply_text(f"Error: {e}")
 
+# --- Global Ban/Unban commands (owner/sudo only) ---
+async def gban_cmd(client: Client, message: Message):
+    """Ban a user from any group (owner/sudo only)."""
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+
+    args = get_args(message)
+    if len(args) < 2:
+        return await message.reply_text("Usage: `/gban <group_id> <user_id> [reason]`")
+
+    try:
+        group_id = int(args[0])
+        user_id = int(args[1])
+    except ValueError:
+        return await message.reply_text("❌ Group ID and User ID must be integers.")
+
+    reason = " ".join(args[2:]) if len(args) > 2 else "No reason provided"
+
+    # Check if bot is admin in the target group
+    try:
+        bot_member = await client.get_chat_member(group_id, (await client.get_me()).id)
+        if bot_member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            return await message.reply_text(f"❌ I am not an admin in group `{group_id}`.")
+        if not bot_member.privileges or not bot_member.privileges.can_restrict_members:
+            return await message.reply_text(f"❌ I do not have 'ban members' permission in group `{group_id}`.")
+    except Exception as e:
+        return await message.reply_text(f"❌ Failed to verify bot status in group `{group_id}`: {e}")
+
+    # Perform ban
+    try:
+        await client.ban_chat_member(group_id, user_id)
+        # Optionally, get user info
+        user = await client.get_users(user_id)
+        group = await client.get_chat(group_id)
+        await message.reply_text(
+            f"✅ **Global Ban**\n"
+            f"👤 User: {user.mention} (`{user.id}`)\n"
+            f"🏠 Group: {group.title} (`{group.id}`)\n"
+            f"📝 Reason: {reason}\n"
+            f"🔨 Action: Banned"
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to ban user: {e}")
+
+async def gunban_cmd(client: Client, message: Message):
+    """Unban a user from any group (owner/sudo only)."""
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+
+    args = get_args(message)
+    if len(args) < 2:
+        return await message.reply_text("Usage: `/gunban <group_id> <user_id>`")
+
+    try:
+        group_id = int(args[0])
+        user_id = int(args[1])
+    except ValueError:
+        return await message.reply_text("❌ Group ID and User ID must be integers.")
+
+    # Check if bot is admin in the target group
+    try:
+        bot_member = await client.get_chat_member(group_id, (await client.get_me()).id)
+        if bot_member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+            return await message.reply_text(f"❌ I am not an admin in group `{group_id}`.")
+        if not bot_member.privileges or not bot_member.privileges.can_restrict_members:
+            return await message.reply_text(f"❌ I do not have 'ban members' permission in group `{group_id}`.")
+    except Exception as e:
+        return await message.reply_text(f"❌ Failed to verify bot status in group `{group_id}`: {e}")
+
+    # Perform unban
+    try:
+        await client.unban_chat_member(group_id, user_id)
+        user = await client.get_users(user_id)
+        group = await client.get_chat(group_id)
+        await message.reply_text(
+            f"✅ **Global Unban**\n"
+            f"👤 User: {user.mention} (`{user.id}`)\n"
+            f"🏠 Group: {group.title} (`{group.id}`)\n"
+            f"🔓 Action: Unbanned"
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to unban user: {e}")
+
 async def ban(client: Client, message: Message, verified=False, admin_id: int = None):
     
     # Only groups allowed
@@ -12213,7 +12296,8 @@ def main():
         "fbanlist": fban_list, "feddemoteme": feddemoteme, "bioconfig": bioconfig_cmd, "allow": allow_bio_user,
         "unallow": unallow_bio_user, "aplist": aplist_bio, "filter": filter_cmd_handler, "stop": stop_filter_handler,
         "filters": list_filters_handler,"antichannelpin": antichannelpin_command,"cleanlinked": cleanlinked_command, "anonadmin": anonadmin_command,
-        "chats": chats_cmd,
+        "chats": chats_cmd, "gban": gban_cmd,
+        "gunban": gunban_cmd,
         "pchats": pchats_cmd,
         "getlink": getlink_cmd,
         "broadcast": broadcast_cmd,
