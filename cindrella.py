@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 import aiohttp
+from pyrogram.enums import ChatMemberStatus
 from aiohttp import web
 from collections import defaultdict, deque
 from contextlib import suppress
@@ -994,23 +995,23 @@ async def check_target_status(client, chat_id, user_id, action):
         member = await client.get_chat_member(chat_id, user_id)
 
         # admin protection
-        if member.status in ["administrator", "creator"]:
+        if member.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
             return "admin"
 
         # already banned
-        if action in ["ban", "dban", "sban", "tban"] and member.status == "kicked":
+        if action in ["ban", "dban", "sban", "tban"] and member.status == enums.ChatMemberStatus.BANNED:
             return "already_banned"
 
         # already muted
-        if action == "mute" and member.status == "restricted":
+        if action == "mute" and member.status == enums.ChatMemberStatus.RESTRICTED:
             if not member.permissions.can_send_messages:
                 return "already_muted"
 
         return "ok"
 
-    except:
+    except Exception:
         return "ok"
-
+    
 async def require_admin_proof(client: Client, message: Message, action_name: str) -> bool:
     # If anonymous admin detection
     if message.from_user is None and message.sender_chat:
@@ -4011,6 +4012,14 @@ async def tban(client: Client, message: Message, verified=False, admin_id: int =
     if not user:
         return
 
+    # --- ADD ADMIN CHECK ---
+    status = await check_target_status(client, message.chat.id, user.id, "tban")
+    if status == "admin":
+        return await message.reply_text("I can't ban an admin.")
+    if status == "already_banned":
+        return await message.reply_text("User already banned.")
+    # --- END ADDITION ---
+
     # Parse duration from args (e.g., /tban 2h)
     args = get_args(message)
     duration = 3600  # default 1 hour
@@ -4023,6 +4032,7 @@ async def tban(client: Client, message: Message, verified=False, admin_id: int =
     await client.ban_chat_member(message.chat.id, user.id, until_date=to_datetime(until))
 
     await message.reply_text(f"{user.mention} banned for {duration//3600} hour(s).")
+    
 
 async def unban(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
