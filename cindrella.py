@@ -1108,6 +1108,10 @@ async def get_chat_setting(chat_id: int, key: str, default: str = "0") -> str:
     doc = await chat_settings_col.find_one({"chat_id": chat_id})
     if doc and key in doc:
         return str(doc[key])
+    # Defaults for voice chat features
+    vc_defaults = {"vc_msg_enabled": "1", "vc_invite_enabled": "1"}
+    if key in vc_defaults:
+        return vc_defaults[key]
     return default
 
 async def set_chat_setting(chat_id: int, key: str, value: str) -> None:
