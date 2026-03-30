@@ -10,6 +10,8 @@ import re
 import time
 import uuid
 import aiohttp
+from pyrogram.types import ChatMemberUpdated
+from pyrogram.handlers import ChatMemberUpdatedHandler
 from pyrogram.enums import ChatMemberStatus
 from aiohttp import web
 from collections import defaultdict, deque
@@ -2288,30 +2290,59 @@ async def on_new_members(client: Client, message: Message) -> None:
             welcome_data = settings.get("welcome", {})
             await send_welcome_goodbye(client, chat_id, member, welcome_data, reply_to_message_id=message.id)
 
+# Cache to prevent duplicates
+welcome_cache = {}
+CACHE_TTL = 5
 
-async def on_left_member(client: Client, event):
-    if isinstance(event, Message):
-        chat_id = event.chat.id
-        user = event.left_chat_member
-        message_id = event.id
-    else:
-        chat_id = event.chat.id
-        user = event.old_chat_member.user
-        message_id = None
+async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
+    # Welcome when a user becomes a member (approved joins)
+    if (update.new_chat_member and 
+        update.new_chat_member.status == enums.ChatMemberStatus.MEMBER and
+        (update.old_chat_member is None or update.old_chat_member.status != enums.ChatMemberStatus.MEMBER)):
+        user = update.new_chat_member.user
+        if user.is_bot:
+            return
+        chat_id = update.chat.id
+        key = (chat_id, user.id)
+        now = time.time()
+        if key in welcome_cache and now - welcome_cache[key] < CACHE_TTL:
+            return
+        welcome_cache[key] = now
 
-    if not user or user.is_bot:
+        settings = await get_chat_settings(chat_id)
+        if settings.get("welcome_enabled", False):
+            welcome_data = settings.get("welcome", {})
+            await send_welcome_goodbye(client, chat_id, user, welcome_data)    
+# Simple cache to prevent duplicate goodbye messages
+goodbye_cache = {}
+CACHE_TTL = 5  # seconds
+
+async def on_left_member(client: Client, message: Message) -> None:
+    """
+    Sends goodbye message when a user leaves the group, is kicked, or banned.
+    """
+    # Only process if it's a left member event
+    if not message.left_chat_member:
         return
 
+    user = message.left_chat_member
+    if user.is_bot:
+        return
+
+    chat_id = message.chat.id
+
+    # Deduplication: avoid double messages if both service message and ChatMemberUpdated fire
+    key = (chat_id, user.id)
+    now = time.time()
+    if key in goodbye_cache and now - goodbye_cache[key] < CACHE_TTL:
+        return
+    goodbye_cache[key] = now
+
+    # Send goodbye message if enabled
     settings = await get_chat_settings(chat_id)
-    if not settings.get("goodbye_enabled", False):
-        return
-
-    goodbye_data = settings.get("goodbye", {})
-    if not isinstance(event, Message):
-        if event.new_chat_member and event.new_chat_member.status in {enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT}:
-            await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message_id)
-    else:
-        await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message_id)
+    if settings.get("goodbye_enabled", False):
+        goodbye_data = settings.get("goodbye", {})
+        await send_welcome_goodbye(client, chat_id, user, goodbye_data)
 
 async def setrules(client: Client, message: Message, verified=False) -> None:
     # Only groups allowed
@@ -12403,6 +12434,8 @@ def main():
     app.add_handler(MessageHandler(cleanlinked_handler, filters.group), group=9)
     app.add_handler(MessageHandler(unsubscribe_fed, filters.command("unsubfed")))
     app.add_handler(MessageHandler(nightmode_handler, filters.group & ~filters.service), group=3)
+    app.add_handler(ChatMemberUpdatedHandler(on_chat_member_update))
+    
     
     async def start_bot():
         await app.start()
