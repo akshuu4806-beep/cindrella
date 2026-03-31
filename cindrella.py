@@ -12587,21 +12587,21 @@ def main():
     
     
     async def start_bot():
-    await app.start()
-    web_task = asyncio.create_task(run_web())
-    await permapin_messages_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
-    asyncio.create_task(expire_warns_loop())
-    asyncio.create_task(expire_antiraid_loop())
-    print("Bot is now online and running!")
-    try:
-        await idle()
-    finally:
-        web_task.cancel()
+        await app.start()
+        web_task = asyncio.create_task(run_web())
+        await permapin_messages_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
+        asyncio.create_task(expire_warns_loop())
+        asyncio.create_task(expire_antiraid_loop())
+        print("Bot is now online and running!")
         try:
-            await web_task
-        except asyncio.CancelledError:
-            pass
-        await app.stop()
+            await idle()
+        finally:
+            web_task.cancel()
+            try:
+                await web_task
+            except asyncio.CancelledError:
+                pass
+            await app.stop()
 
     app.run(start_bot())
 
