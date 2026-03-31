@@ -6,6 +6,12 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 # -------------------------
 import os
+from pyrogram import Client, filters
+from pyrogram.types import Message
+
+from config import OWNER_ID
+from your_project.database import user_profile_col
+from your_project.settings import get_chat_setting, set_chat_setting
 import re
 import time
 import uuid
@@ -4649,6 +4655,153 @@ async def unlockall(client: Client, message: Message, verified=False, admin_id=N
 
     except Exception as e:
         await message.reply_text(f"Error: {e}")
+
+async def track_toggle(client: Client, message: Message):
+
+    # 🔒 only owner
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only bot owner can use this.")
+
+    if len(message.command) < 2:
+        return await message.reply_text("Usage: /track on or /track off")
+
+    state = message.command[1].lower()
+
+    if state == "on":
+        await set_chat_setting(message.chat.id, "tracker_enabled", "1")
+        await message.reply_text("✅ Tracker Enabled")
+    elif state == "off":
+        await set_chat_setting(message.chat.id, "tracker_enabled", "0")
+        await message.reply_text("❌ Tracker Disabled")
+    else:
+        await message.reply_text("Use: on / off")
+
+
+async def message_tracker(client: Client, message: Message):
+
+    if not message.from_user:
+        return
+
+    chat_id = message.chat.id
+    user = message.from_user
+
+    enabled = await get_chat_setting(chat_id, "tracker_enabled", "0")
+    if enabled != "1":
+        return
+
+    new_name = f"{user.first_name} {user.last_name or ''}".strip()
+    new_username = user.username or "None"
+
+    old = await user_profile_col.find_one({
+        "user_id": user.id,
+        "chat_id": chat_id
+    })
+
+    changes = []
+
+    if old:
+        if old.get("name") != new_name:
+            changes.append(f"👤 Name changed\n• Old: {old.get('name')}\n• New: {new_name}")
+
+        if old.get("username") != new_username:
+            changes.append(f"🔗 Username changed\n• Old: @{old.get('username')}\n• New: @{new_username}")
+
+    # update db
+    await user_profile_col.update_one(
+        {"user_id": user.id, "chat_id": chat_id},
+        {"$set": {"name": new_name, "username": new_username}},
+        upsert=True
+    )
+
+    if changes:
+        await message.reply_text(
+            f"🕵️ Profile Updated\n\n{user.mention}\n\n" + "\n\n".join(changes)
+        )
+
+async def leave_tracker(client: Client, message: Message):
+
+    user = message.left_chat_member
+    chat_id = message.chat.id
+
+    enabled = await get_chat_setting(chat_id, "tracker_enabled", "0")
+    if enabled != "1":
+        return
+
+    new_name = f"{user.first_name} {user.last_name or ''}".strip()
+    new_username = user.username or "None"
+
+    old = await user_profile_col.find_one({
+        "user_id": user.id,
+        "chat_id": chat_id
+    })
+
+    changes = []
+
+    if old:
+        if old.get("name") != new_name:
+            changes.append(f"👤 Name changed before leaving\n• Old: {old.get('name')}\n• New: {new_name}")
+
+        if old.get("username") != new_username:
+            changes.append(f"🔗 Username changed before leaving\n• Old: @{old.get('username')}\n• New: @{new_username}")
+
+    # update db
+    await user_profile_col.update_one(
+        {"user_id": user.id, "chat_id": chat_id},
+        {"$set": {"name": new_name, "username": new_username}},
+        upsert=True
+    )
+
+    if changes:
+        await message.reply_text(
+            f"🚪 User Left & Profile Changed\n\n{user.mention}\n\n" + "\n\n".join(changes)
+        )
+
+async def join_tracker(client: Client, message: Message):
+
+    chat_id = message.chat.id
+
+    enabled = await get_chat_setting(chat_id, "tracker_enabled", "0")
+    if enabled != "1":
+        return
+
+    for user in message.new_chat_members:
+
+        new_name = f"{user.first_name} {user.last_name or ''}".strip()
+        new_username = user.username or "None"
+
+        old = await user_profile_col.find_one({
+            "user_id": user.id,
+            "chat_id": chat_id
+        })
+
+        changes = []
+
+        if old:
+            if old.get("name") != new_name:
+                changes.append(
+                    f"👤 Name changed\n• Old: {old.get('name')}\n• New: {new_name}"
+                )
+
+            if old.get("username") != new_username:
+                changes.append(
+                    f"🔗 Username changed\n• Old: @{old.get('username')}\n• New: @{new_username}"
+                )
+
+        # update DB
+        await user_profile_col.update_one(
+            {"user_id": user.id, "chat_id": chat_id},
+            {"$set": {
+                "name": new_name,
+                "username": new_username
+            }},
+            upsert=True
+        )
+
+        if changes:
+            await message.reply_text(
+                f"🟢 User Joined & Profile Updated\n\n{user.mention}\n\n"
+                + "\n\n".join(changes)
+            )
 
 async def cleanservice(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     await generic_toggle(client, message, "clean_service", "cleanservice", verified, admin_id)
@@ -12341,7 +12494,7 @@ def main():
         "addsudo": add_sudo,
         "rmsudo": rm_sudo,
         "sudolist": sudo_list,
-        "gchats": gchats_cmd,
+        "gchats": gchats_cmd, "track": track_toggle,
     }
 
     # Multi-word commands (exact match)
@@ -12422,6 +12575,7 @@ def main():
     app.add_handler(MessageHandler(bio_and_link_scanner, filters.group & ~filters.service & ~filters.command(list(commands.keys()))), group=4)
     app.add_handler(MessageHandler(service_cleaner, filters.service), group=2)
     app.add_handler(MessageHandler(track_activity, filters.group & ~filters.service), group=3)
+    app.add_handler(MessageHandler(message_tracker, filters.group & ~filters.service), group=4)
     app.add_handler(MessageHandler(filter_handler, filters.group & ~filters.service), group=5)
     app.add_handler(MessageHandler(safety_handler, filters.group & ~filters.service), group=6)
     app.add_handler(MessageHandler(clean_cmd_handler, filters.command(list(commands.keys()))), group=7)
