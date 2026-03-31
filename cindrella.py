@@ -8,8 +8,6 @@ except RuntimeError:
 import os
 from pyrogram import Client, filters
 from pyrogram.types import Message
-
-from config import OWNER_ID
 from your_project.database import user_profile_col
 from your_project.settings import get_chat_setting, set_chat_setting
 import re
