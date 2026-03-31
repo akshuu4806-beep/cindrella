@@ -18,7 +18,7 @@ from pyrogram.enums import ChatMemberStatus
 from aiohttp import web
 from collections import defaultdict, deque
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from html import escape
@@ -747,7 +747,7 @@ def is_night_time(start_str: str, end_str: str) -> bool:
     end_h, end_m = parsed_end
 
     # get current time in Kolkata (UTC+5:30)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     kolkata = now + timedelta(hours=5, minutes=30)
     current_h = kolkata.hour
     current_m = kolkata.minute
