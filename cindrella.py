@@ -9698,43 +9698,40 @@ async def canceltag(client: Client, message: Message) -> None:
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 async def utag(client: Client, message: Message) -> None:
-    # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
         return
-    
-    # --- NEW: Bot must be admin and have restrict members permission ---
+
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
 
-    # check if anonymous / enormous admin
+    # --- Anonymous admin handling ---
     if message.sender_chat:
-        # Check if anonymous admin mode is enabled
         if await get_anonadmin_enabled(message.chat.id):
-            # Bypass button – proceed directly
-            await _utag_main(client, message)
+            return await _utag_main(client, message)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_warn_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "target_id": None,
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔐 Click to prove admin", callback_data=f"proveatag:{action_id}")]]
+            )
+            msg = await message.reply_text(
+                "⚠️ Anonymous / Enormous admin detected.\nPress button to confirm identity before tagging.",
+                reply_markup=keyboard
+            )
+            asyncio.create_task(delete_verify_button(msg))
             return
 
-        # Otherwise, send proof button (existing code)
-        action_id = str(uuid.uuid4())
-        pending_warn_actions[action_id] = {
-            "chat_id": message.chat.id,
-            "message": message,
-            "target_id": None,
-            "time": time.time(),
-            "used": False
-        }
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔐 Click to prove admin", callback_data=f"proveatag:{action_id}")]]
-        )
-        msg = await message.reply_text(
-            "⚠️ Anonymous / Enormous admin detected.\nPress button to confirm identity before tagging.",
-            reply_markup=keyboard
-        )
-        asyncio.create_task(delete_verify_button(msg))
+    # --- Normal user admin check ---
+    if not await require_admin(client, message):
         return
 
-    # Normal admin flow
     await _utag_main(client, message)
 
 async def _utag_main(client: Client, message: Message):
@@ -9780,46 +9777,41 @@ async def _utag_main(client: Client, message: Message):
 
 
 async def atag(client: Client, message: Message) -> None:
-    # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("This command only works in groups.")
         return
-    
-    # --- NEW: Bot must be admin and have restrict members permission ---
+
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
 
-
-    # check if anonymous / enormous admin
+    # --- Anonymous admin handling ---
     if message.sender_chat:
-        # Check if anonymous admin mode is enabled
         if await get_anonadmin_enabled(message.chat.id):
-            # Bypass button – proceed directly
-            await _atag_main(client, message)
+            return await _atag_main(client, message)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_warn_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "target_id": None,
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔐 Click to prove admin", callback_data=f"proveatag:{action_id}")]]
+            )
+            msg = await message.reply_text(
+                "⚠️ Anonymous / Enormous admin detected.\nPress button to confirm identity before admin tagging.",
+                reply_markup=keyboard
+            )
+            asyncio.create_task(delete_verify_button(msg))
             return
 
-        # Otherwise, send proof button (existing code)
-        action_id = str(uuid.uuid4())
-        pending_warn_actions[action_id] = {
-            "chat_id": message.chat.id,
-            "message": message,
-            "target_id": None,
-            "time": time.time(),
-            "used": False
-        }
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔐 Click to prove admin", callback_data=f"proveatag:{action_id}")]]
-        )
-        msg = await message.reply_text(
-            "⚠️ Anonymous / Enormous admin detected.\nPress button to confirm identity before admin tagging.",
-            reply_markup=keyboard
-        )
-        asyncio.create_task(delete_verify_button(msg))
+    # --- Normal user admin check ---
+    if not await require_admin(client, message):
         return
 
-    # Normal admin flow
     await _atag_main(client, message)
-
 
 async def _atag_main(client: Client, message: Message):
     chat_id = message.chat.id
@@ -10923,6 +10915,12 @@ async def prove_admin_callback(client: Client, callback_query: CallbackQuery):
     elif command == "setfloodtimer":
         await setfloodtimer_cmd(client, msg, verified=True, admin_id=callback_query.from_user.id)
 
+    elif command == "utag":
+        await utag(client, msg, verified=True, admin_id=callback_query.from_user.id)
+
+    elif command == "atag":
+        await atag(client, msg, verified=True, admin_id=callback_query.from_user.id)
+    
     del pending_admin_actions[action_id]
 
 async def proveatag_callback(client: Client, callback_query: CallbackQuery):
