@@ -8,8 +8,6 @@ except RuntimeError:
 import os
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from your_project.database import user_profile_col
-from your_project.settings import get_chat_setting, set_chat_setting
 import re
 import time
 import uuid
@@ -78,7 +76,8 @@ bio_warns_col = mongo_db["bio_warns"]
 system_info_col = mongo_db["system_info"]
 permapin_messages_col = mongo_db["permapin_messages"]
 autoantiraid_joins: dict[int, deque] = defaultdict(deque)
- # --- Owner & Sudo collections ---
+user_profile_col = mongo_db["user_profile"] 
+# --- Owner & Sudo collections ---
 sudo_users_col = mongo_db["sudo_users"]
 active_chats_col = mongo_db["active_chats"]
 # --- Link detection regex ---
