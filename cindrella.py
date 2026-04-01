@@ -635,23 +635,29 @@ async def is_owner_or_sudo(user_id: int) -> bool:
     return doc is not None
 
 async def get_chat_link(client: Client, chat) -> str:
-    """Generate a clickable link for a chat."""
+    """Generate a clickable link for a chat. Returns None if no link is available."""
     if isinstance(chat, int):
         chat = await client.get_chat(chat)
     if chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        # Public group with username
         if chat.username:
             return f"https://t.me/{chat.username}"
-        else:
-            # Try to get an invite link (bot must be admin with can_invite_users)
-            try:
+        # Private group – try to get an invite link
+        try:
+            # Check if bot has invite permission
+            bot_member = await client.get_chat_member(chat.id, (await client.get_me()).id)
+            if bot_member.privileges and bot_member.privileges.can_invite_users:
                 invite = await client.export_chat_invite_link(chat.id)
                 return invite
-            except:
+            else:
+                # Fallback: deep link (only works for members)
                 return f"tg://openchat?chat_id={chat.id}"
+        except Exception:
+            return f"tg://openchat?chat_id={chat.id}"
     elif chat.type == enums.ChatType.PRIVATE:
         return f"tg://user?id={chat.id}"
-    else:
-        return "No link available"
+    return None
+
 
 # --- Autoantiraid & antiraid punish settings ---
 async def get_autoantiraid_threshold(chat_id: int) -> int:
@@ -1596,9 +1602,69 @@ async def getlink_cmd(client: Client, message: Message):
         return await message.reply_text("Serial number out of range.")
     chat_data = chats[sn-1]
     chat_id = chat_data["chat_id"]
-    chat = await client.get_chat(chat_id)
+    try:
+        chat = await client.get_chat(chat_id)
+    except Exception as e:
+        return await message.reply_text(f"Failed to fetch chat: {e}")
+
     link = await get_chat_link(client, chat)
-    await message.reply_text(f"**Link for {chat_data.get('title', 'Unknown')}**\n{link}")
+    title = chat_data.get("title", "Unknown")
+    chat_type = chat_data.get("type", "unknown")
+
+    if link:
+        # Create a clickable button
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Click to open", url=link)]])
+        text = (
+            f"**{title}** (`{chat_id}`)\n"
+            f"Type: {chat_type}\n"
+            f"Link ready:"
+        )
+        await message.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.MARKDOWN)
+    else:
+        await message.reply_text(f"Could not generate a link for **{title}** (`{chat_id}`).", parse_mode=enums.ParseMode.MARKDOWN)
+        
+async def syncchats_cmd(client: Client, message: Message):
+    """Remove inactive chats from the active_chats collection."""
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ You are not authorized to use this command.")
+
+    await message.reply_text("🔄 Syncing active chats... This may take a while.")
+
+    bot_me = await client.get_me()
+    bot_id = bot_me.id
+    removed = 0
+    total = 0
+
+    # Iterate over all active chats
+    async for chat_data in active_chats_col.find({}):
+        total += 1
+        chat_id = chat_data["chat_id"]
+        chat_type = chat_data.get("type", "unknown")
+
+        # For groups and supergroups, check if bot is still a member
+        if chat_type in ("group", "supergroup"):
+            try:
+                member = await client.get_chat_member(chat_id, bot_id)
+                # If bot is not a member (i.e., status not in MEMBER, ADMIN, OWNER), delete
+                if member.status not in (enums.ChatMemberStatus.MEMBER,
+                                         enums.ChatMemberStatus.ADMINISTRATOR,
+                                         enums.ChatMemberStatus.OWNER):
+                    await active_chats_col.delete_one({"chat_id": chat_id})
+                    removed += 1
+            except Exception as e:
+                # If any error occurs (chat deleted, bot not found, etc.), treat as inactive
+                print(f"Error checking chat {chat_id}: {e}")
+                await active_chats_col.delete_one({"chat_id": chat_id})
+                removed += 1
+        else:
+            # For private chats, we keep them (no reliable way to detect block)
+            pass
+
+    await message.reply_text(
+        f"✅ Sync complete.\n"
+        f"Total active chats processed: {total}\n"
+        f"Removed inactive groups: {removed}"
+    )
 
 async def broadcast_cmd(client: Client, message: Message, pin=False, mode="all"):
     if not await is_owner_or_sudo(message.from_user.id):
@@ -12490,7 +12556,7 @@ def main():
         "pcastunpin": pcastunpin_cmd,
         "addsudo": add_sudo,
         "rmsudo": rm_sudo,
-        "sudolist": sudo_list,
+        "sudolist": sudo_list, "syncchats": syncchats_cmd,
         "gchats": gchats_cmd, "track": track_toggle,
     }
 
