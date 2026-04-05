@@ -3729,6 +3729,8 @@ async def mute(client: Client, message: Message, verified=False, admin_id: int =
         ChatPermissions(can_send_messages=False)
     )
 
+    await send_log(client, message.chat.id, "admin", "Mute", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+    
     await message.reply_text(f"🔇 {target.mention} muted.")
 
 async def dmute(client: Client, message: Message, verified=False, admin_id: int = None):
@@ -3886,6 +3888,7 @@ async def smute(client: Client, message: Message, verified=False, admin_id: int 
         uid,
         ChatPermissions(can_send_messages=False)
     )    
+    await send_log(client, message.chat.id, "admin", "Mute (silent)", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
 
 async def tmute(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
@@ -3965,6 +3968,9 @@ async def tmute(client: Client, message: Message, verified=False, admin_id: int 
         until_date=to_datetime(until)
     )
 
+    duration_str = args[0] if args else "0"
+await send_log(client, message.chat.id, "admin", f"Temporary Mute ({duration_str})", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+    
     await message.reply_text(f"🔇 {target.mention} muted for {args[0]}.")
 
 async def unmute(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
@@ -4048,6 +4054,8 @@ async def unmute(client: Client, message: Message, verified=False, admin_id: int
             )
         )
 
+        await send_log(client, message.chat.id, "admin", "Unmute", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+        
         await message.reply_text(f"🔊 {target.mention} unmuted.")
 
     except Exception as e:
@@ -4494,6 +4502,7 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
 
     await client.ban_chat_member(message.chat.id, user.id)
     await client.unban_chat_member(message.chat.id, user.id)
+    await send_log(client, message.chat.id, "admin", "Kick", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     await message.reply_text(f"{user.mention} kicked.")
 
 async def skick(client: Client, message: Message, verified=False, admin_id: int = None):
@@ -4542,6 +4551,7 @@ async def skick(client: Client, message: Message, verified=False, admin_id: int 
         return
 
     await client.ban_chat_member(message.chat.id, user.id)
+    await send_log(client, message.chat.id, "admin", "Kick (silent)", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     await client.unban_chat_member(message.chat.id, user.id)
 
 async def dkick(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
@@ -4602,6 +4612,7 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
     try:
         await client.ban_chat_member(chat_id, user_id)
         await client.unban_chat_member(chat_id, user_id)
+        await send_log(client, chat_id, "admin", "Kick (delete)", user.mention, user_id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     except Exception as e:
         await message.reply_text(f"❌ Failed to kick: {e}")
         return
@@ -5514,6 +5525,8 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text(f"Promoted! {title}")
     except Exception as e:
         await message.reply_text(f"Failed to promote: {e}")
+        extra = f"Title: {title}" if title else None
+        await send_log(client, message.chat.id, "admin", "Promote", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous", extra=extra)
         
 async def demote(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
@@ -5591,7 +5604,8 @@ async def demote(client: Client, message: Message, verified=False, admin_id: int
         await message.reply_text(f"Demoted.")
     except Exception as e:
         await message.reply_text(f"Failed to demote: {e}")
-
+        await send_log(client, message.chat.id, "admin", "Demote", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+        
 async def setgpic(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
