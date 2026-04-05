@@ -8,6 +8,7 @@ except RuntimeError:
 import os
 from pyrogram import Client, filters
 from pyrogram.types import Message
+import json
 import re
 import time
 import uuid
@@ -145,6 +146,43 @@ LOCK_TYPES = {"media", "sticker", "gif", "voice", "poll", "link", "emoji", "text
 active_users: dict[int, deque[int]] = defaultdict(lambda: deque(maxlen=300))
 flood_timer_tracker: dict[tuple[int, int], list] = defaultdict(list)
 pending_warnmode = {}  # key: session_id, value: {chat_id, user_id, action, duration_min_str, message_id}
+
+# ========== LOG CHANNEL CATEGORIES ==========
+DEFAULT_LOG_CATEGORIES = {
+    "settings": True,   # bot settings toggles, welcome, rules, etc.
+    "admin": True,      # bans, mutes, warns, promotes, demotes
+    "user": True,       # join, leave, kickme
+    "automated": True,  # flood, antiraid, bio, captcha
+    "reports": True,    # /report and @admins
+    "other": True       # notes, filters, pins, etc.
+}
+
+async def send_log(client: Client, chat_id: int, category: str, action: str, user_mention: str, user_id: int, admin_mention: str = None, reason: str = None, extra: str = None):
+    """Send log to configured channel only if category is enabled."""
+    log_chan = await get_chat_setting(chat_id, "log_channel", "not_set")
+    if log_chan == "not_set":
+        return
+
+    # Load categories (as JSON string) and check if enabled
+    categories_str = await get_chat_setting(chat_id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
+    categories = json.loads(categories_str) if isinstance(categories_str, str) else categories_str
+    if not categories.get(category, True):
+        return
+
+    text = f"📋 **{category.upper()} LOG** | Chat ID: `{chat_id}`\n\n"
+    text += f"**Action:** {action}\n"
+    text += f"**User:** {user_mention} (`{user_id}`)\n"
+    if admin_mention:
+        text += f"**Admin:** {admin_mention}\n"
+    if reason:
+        text += f"**Reason:** {reason}\n"
+    if extra:
+        text += f"**Extra:** {extra}\n"
+
+    try:
+        await client.send_message(int(log_chan), text, parse_mode=enums.ParseMode.MARKDOWN)
+    except Exception as e:
+        print(f"Failed to send log to {log_chan}: {e}")
 
 # --- Language support (English only now, but structure kept for future) ---
 LANG = {
@@ -392,8 +430,13 @@ HELP_SECTIONS: dict[str, tuple[str, str]] = {
         (
             "Log important actions to a separate channel.\n\n"
             "Commands:\n"
-            "- `/setlogchannel <chat_id>`: Set a log channel for this group.\n"
-            "- `/logchannel`: Show the current log channel."
+            "- `/setlog`: Set the log channel for this group (forward from your channel).\n"
+            "- `/unsetlog`: Unset the log channel.\n"
+            "- `/logchannel`: Show the current log channel.\n"
+            "- `/logcategories`: List all log categories.\n"
+            "- `/log <category>`: Enable logging for a category.\n"
+            "- `/nolog <category>`: Disable logging for a category.\n\n"
+            "Categories: settings, admin, user, automated, reports, other."
         )
     ),
     "privacy": (
@@ -1097,6 +1140,18 @@ async def expire_warns_loop():
 
         await asyncio.sleep(60)  # check every minute
 
+async def is_chat_owner(client: Client, message: Message) -> bool:
+    """Check if the user (or anonymous admin) is the chat owner."""
+    if message.from_user:
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if member.status == enums.ChatMemberStatus.OWNER:
+            return True
+    if message.sender_chat:
+        member = await client.get_chat_member(message.chat.id, message.sender_chat.id)
+        if member.status == enums.ChatMemberStatus.OWNER:
+            return True
+    return False
+    
 async def bot_is_admin(client: Client, chat_id: int) -> bool:
     """Check if bot is an admin in the chat."""
     try:
@@ -1505,6 +1560,111 @@ async def help_buttons(client: Client, callback_query: CallbackQuery) -> None:
     else:
         await q.edit_message_text(body, parse_mode=enums.ParseMode.HTML, reply_markup=back_keyboard())
 
+async def setlog_command(client: Client, message: Message):
+    """
+    Usage:
+    1. Add bot to your channel as admin.
+    2. Send /setlog in that channel.
+    3. Forward that message to the group you want logged.
+    """
+    # If command is used in a channel (sender_chat exists and it's a channel)
+    if message.sender_chat and message.sender_chat.type == enums.ChatType.CHANNEL:
+        await message.reply_text(
+            "✅ Now forward this message to the group you want to log.\n\n"
+            "After forwarding, the log channel will be set automatically."
+        )
+        return
+
+    # If command is forwarded from a channel (check reply_to_message)
+    if message.reply_to_message and message.reply_to_message.sender_chat:
+        channel_chat = message.reply_to_message.sender_chat
+        if channel_chat.type == enums.ChatType.CHANNEL:
+            # 🔒 Only group owner can set log channel
+            if not await is_chat_owner(client, message):
+                return await message.reply_text("❌ Only the group owner can set the log channel.")
+            
+            log_channel_id = channel_chat.id
+            await set_chat_setting(message.chat.id, "log_channel", str(log_channel_id))
+            await set_chat_setting(message.chat.id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
+            await message.reply_text(f"✅ Log channel set to {channel_chat.title} (ID: `{log_channel_id}`)")
+            return
+
+    # Otherwise, show help
+    await message.reply_text(
+        "**How to set a log channel:**\n\n"
+        "1. Add me to your channel as an admin.\n"
+        "2. Send `/setlog` in that channel.\n"
+        "3. Forward that message to this group.\n\n"
+        "That's it! Logs will start appearing in your channel."
+    )
+
+async def unsetlog_command(client: Client, message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await message.reply_text("This command only works in groups.")
+    if not await is_chat_owner(client, message):
+        return await message.reply_text("❌ Only the group owner can unset the log channel.")
+    await set_chat_setting(message.chat.id, "log_channel", "not_set")
+    await set_chat_setting(message.chat.id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
+    await message.reply_text("✅ Log channel removed for this group.")
+
+async def logchannel_cmd(client: Client, message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await message.reply_text("This command only works in groups.")
+    if not await is_admin(client, message):
+        return await message.reply_text("❌ You need to be an admin to see the log channel.")
+    log_chan = await get_chat_setting(message.chat.id, "log_channel", "not_set")
+    await message.reply_text(f"📋 Log channel: `{log_chan}`")
+
+async def logcategories_cmd(client: Client, message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await message.reply_text("This command only works in groups.")
+    if not await is_chat_owner(client, message):
+        return await message.reply_text("❌ Only the group owner can manage log categories.")
+    
+    categories_str = await get_chat_setting(message.chat.id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
+    categories = json.loads(categories_str) if isinstance(categories_str, str) else categories_str
+    
+    text = "**📋 Log Categories**\n\n"
+    for cat, enabled in categories.items():
+        status = "✅" if enabled else "❌"
+        text += f"{status} `{cat}`\n"
+    text += "\nUse `/log <category>` to enable, `/nolog <category>` to disable."
+    await message.reply_text(text)
+    
+async def log_enable(client: Client, message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await message.reply_text("This command only works in groups.")
+    if not await is_chat_owner(client, message):
+        return await message.reply_text("❌ Only the group owner can change log settings.")
+    
+    args = get_args(message)
+    if not args or args[0].lower() not in DEFAULT_LOG_CATEGORIES:
+        return await message.reply_text(f"Usage: `/log <category>`\nAvailable: {', '.join(DEFAULT_LOG_CATEGORIES.keys())}")
+    
+    cat = args[0].lower()
+    categories_str = await get_chat_setting(message.chat.id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
+    categories = json.loads(categories_str) if isinstance(categories_str, str) else categories_str
+    categories[cat] = True
+    await set_chat_setting(message.chat.id, "log_categories", json.dumps(categories))
+    await message.reply_text(f"✅ Logging for `{cat}` enabled.")
+    
+async def log_disable(client: Client, message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await message.reply_text("This command only works in groups.")
+    if not await is_chat_owner(client, message):
+        return await message.reply_text("❌ Only the group owner can change log settings.")
+    
+    args = get_args(message)
+    if not args or args[0].lower() not in DEFAULT_LOG_CATEGORIES:
+        return await message.reply_text(f"Usage: `/nolog <category>`\nAvailable: {', '.join(DEFAULT_LOG_CATEGORIES.keys())}")
+    
+    cat = args[0].lower()
+    categories_str = await get_chat_setting(message.chat.id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
+    categories = json.loads(categories_str) if isinstance(categories_str, str) else categories_str
+    categories[cat] = False
+    await set_chat_setting(message.chat.id, "log_categories", json.dumps(categories))
+    await message.reply_text(f"❌ Logging for `{cat}` disabled.")
+    
 async def owner_group(client: Client, message: Message):
     chat = message.chat
 
@@ -2672,6 +2832,10 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
     cnt = len(doc.get("warns", []))
     limit = int(await get_chat_setting(chat_id, "warn_limit", "3"))
 
+    # --- LOG: warning issued ---
+    admin_mention_str = message.from_user.mention if message.from_user else "Anonymous"
+    await send_log(client, chat_id, "admin", f"Warning ({cnt}/{limit})", target.mention, uid, admin_mention=admin_mention_str, reason=reason)
+    
     cmd = cmd_type or (message.command[0] if getattr(message, "command", None) else "")
 
     # 👇 ADD THIS BLOCK
@@ -2695,6 +2859,7 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
     except Exception as e:
         print(f"Warn notify error: {e}")
 
+    
     if cnt >= limit:
         action = await get_warn_action(chat_id)
         now = int(time.time())
@@ -2727,6 +2892,8 @@ async def warn_common(client: Client, message: Message, delete_cmd: bool = False
         # Delete all warns after punishment
         await warns_col.delete_one({"chat_id": chat_id, "user_id": uid})
 
+        await send_log(client, chat_id, "admin", f"Warn limit reached → {action}", target.mention, uid, admin_mention=admin_mention_str, reason=reason, extra=f"Duration: {format_duration(duration) if action in ('tban','tmute') else 'permanent'}")
+        
         if cmd in ["warn", "dwarn"]:
             reply = f"⚠️ {target.mention} exceeded warn limit ({cnt}/{limit}) and was {action_text}."
             if reason:
@@ -4024,6 +4191,8 @@ async def ban(client: Client, message: Message, verified=False, admin_id: int = 
         return await message.reply_text("User already banned.")
 
     await client.ban_chat_member(message.chat.id, user.id)
+    # बैन करने के बाद
+    await send_log(client, message.chat.id, "admin", "Ban", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous", reason=" ".join(args))
     await message.reply_text(f"{user.mention} banned.")
 
 async def dban(client: Client, message: Message, verified=False, admin_id: int = None):
@@ -4095,6 +4264,7 @@ async def dban(client: Client, message: Message, verified=False, admin_id: int =
 
     try:
         await client.ban_chat_member(chat_id, user_id)
+        await send_log(client, chat_id, "admin", "Ban", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
         await message.reply_text(f"✅ {user.mention} banned.")
     except Exception as e:
         await message.reply_text(f"❌ Failed to ban: {e}")
@@ -4149,7 +4319,8 @@ async def sban(client: Client, message: Message, verified=False, admin_id: int =
         return  # silently ignore
 
     await client.ban_chat_member(message.chat.id, user.id)
-
+    await send_log(client, message.chat.id, "admin", "Ban (silent)", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+    
 async def tban(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -4212,7 +4383,8 @@ async def tban(client: Client, message: Message, verified=False, admin_id: int =
 
     until = int(time.time()) + duration
     await client.ban_chat_member(message.chat.id, user.id, until_date=to_datetime(until))
-
+    duration_str = args[0] if args else "1h"
+    await send_log(client, message.chat.id, "admin", f"Temporary Ban ({duration_str})", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     await message.reply_text(f"{user.mention} banned for {duration//3600} hour(s).")
     
 
@@ -4268,6 +4440,7 @@ async def unban(client: Client, message: Message, verified=False, admin_id: int 
         return await message.reply_text("User is already unbanned.")
 
     await client.unban_chat_member(message.chat.id, user.id)
+    await send_log(client, message.chat.id, "admin", "Unban", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     await message.reply_text(f"{user.mention} unbanned.")
 
 async def kick(client: Client, message: Message, verified=False, admin_id: int = None):
@@ -9843,45 +10016,23 @@ async def connection(client: Client, message: Message) -> None:
 
 # export_data, import_data, ddata, deldata removed as per json removal requirement.
 
-async def set_log_channel(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    # Only groups allowed
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await message.reply_text("This command only works in groups.")
-        return
+async def set_global_log(client: Client, message: Message):
+    """Only bot owner or sudo can set log channel for any chat (by providing chat ID)."""
+    if not await is_owner_or_sudo(message.from_user.id):
+        return await message.reply_text("❌ Only bot owner or sudo users can use this command.")
     
-    # Anonymous admin detection
-    if not verified and message.from_user is None and message.sender_chat:
-        if await get_anonadmin_enabled(message.chat.id):
-            return await set_log_channel(client, message, verified=True, admin_id=0)
-        else:
-            action_id = str(uuid.uuid4())
-            pending_admin_actions[action_id] = {
-                "chat_id": message.chat.id,
-                "message": message,
-                "action": "setlogchannel",
-                "time": time.time(),
-                "used": False
-            }
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
-            ]])
-            await message.reply_text(
-                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
-                reply_markup=keyboard
-            )
-            return
-
-    if not (verified and message.from_user is None):
-        if not await require_admin(client, message):
-            return
-
     args = get_args(message)
-    if not args:
-        await message.reply_text("Usage: /setlogchannel <chat_id>")
-        return
-    await set_chat_setting(message.chat.id, "log_channel", args[0])
-    await message.reply_text("Log channel set.")
-
+    if len(args) < 2:
+        return await message.reply_text("Usage: `/setglog <target_chat_id> <log_channel_id>`")
+    try:
+        target_chat_id = int(args[0])
+        log_channel_id = args[1]
+    except ValueError:
+        return await message.reply_text("❌ Chat ID must be an integer.")
+    
+    await set_chat_setting(target_chat_id, "log_channel", log_channel_id)
+    await message.reply_text(f"✅ Global log channel for chat `{target_chat_id}` set to `{log_channel_id}`.")
+    
 async def log_channel(client: Client, message: Message) -> None:
     cid = await get_chat_setting(message.chat.id, "log_channel", "not_set")
     await message.reply_text(f"Log channel: {cid}")
@@ -12516,7 +12667,7 @@ def main():
     commands = {
         "start": start, "clone": clone, "help": help_cmd, "reload": reload_bot, "language": language,
         "owner": owner_group, "antiraid": antiraid_cmd, "connection": connection, "disable": disable_cmd,
-        "enable": enable_cmd, "disabled": disabled_cmds, "setlogchannel": set_log_channel,
+        "enable": enable_cmd, "disabled": disabled_cmds, "setglog": set_global_log,
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
         "welcome": welcome_toggle, "setgoodbye": setgoodbye, "resetgoodbye": resetgoodbye,
         "goodbye": goodbye_toggle, "setrules": setrules, "rules": rules, "setnote": setnote, "setnight": nightmode_cmd,
@@ -12542,7 +12693,7 @@ def main():
         "unallow": unallow_bio_user, "aplist": aplist_bio, "filter": filter_cmd_handler, "stop": stop_filter_handler,
         "filters": list_filters_handler,"antichannelpin": antichannelpin_command,"cleanlinked": cleanlinked_command, "anonadmin": anonadmin_command,
         "chats": chats_cmd, "gban": gban_cmd,
-        "gunban": gunban_cmd,
+        "gunban": gunban_cmd, 
         "pchats": pchats_cmd,
         "getlink": getlink_cmd,
         "broadcast": broadcast_cmd,
@@ -12558,6 +12709,12 @@ def main():
         "rmsudo": rm_sudo,
         "sudolist": sudo_list, "syncchats": syncchats_cmd,
         "gchats": gchats_cmd, "track": track_toggle,
+        "setlog": setlog_command,
+        "unsetlog": unsetlog_command,
+        "logchannel": logchannel_cmd,        # यह पुराने /logchannel को replace करेगा
+        "logcategories": logcategories_cmd,
+        "log": log_enable,
+        "nolog": log_disable,
     }
 
     # Multi-word commands (exact match)
