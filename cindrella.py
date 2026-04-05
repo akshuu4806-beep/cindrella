@@ -3995,7 +3995,7 @@ async def tmute(client: Client, message: Message, verified=False, admin_id: int 
     )
 
     duration_str = args[0] if args else "0"
-await send_log(client, message.chat.id, "admin", f"Temporary Mute ({duration_str})", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+    await send_log(client, message.chat.id, "admin", f"Temporary Mute ({duration_str})", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     
     await message.reply_text(f"🔇 {target.mention} muted for {args[0]}.")
 
