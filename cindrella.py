@@ -158,22 +158,31 @@ DEFAULT_LOG_CATEGORIES = {
 }
 
 async def send_log(client: Client, chat_id: int, category: str, action: str, user_mention: str, user_id: int, admin_mention: str = None, reason: str = None, extra: str = None):
-    """Send log to configured channel only if category is enabled."""
     log_chan = await get_chat_setting(chat_id, "log_channel", "not_set")
     if log_chan == "not_set":
         return
 
-    # Load categories (as JSON string) and check if enabled
     categories_str = await get_chat_setting(chat_id, "log_categories", json.dumps(DEFAULT_LOG_CATEGORIES))
     categories = json.loads(categories_str) if isinstance(categories_str, str) else categories_str
     if not categories.get(category, True):
         return
 
-    text = f"📋 **{category.upper()} LOG** | Chat ID: `{chat_id}`\n\n"
+    # Fetch group title (with fallback)
+    try:
+        chat = await client.get_chat(chat_id)
+        group_name = chat.title or "Unknown Group"
+    except Exception:
+        group_name = "Unknown Group"
+
+    # Convert mentions to plain names
+    plain_user = extract_plain_name(user_mention, user_id)
+    plain_admin = extract_plain_name(admin_mention, user_id) if admin_mention else None
+
+    text = f"📋 **{category.upper()} LOG** | Group: **{group_name}** (ID: `{chat_id}`)\n\n"
     text += f"**Action:** {action}\n"
-    text += f"**User:** {user_mention} (`{user_id}`)\n"
-    if admin_mention:
-        text += f"**Admin:** {admin_mention}\n"
+    text += f"**User:** {plain_user} (ID: `{user_id}`)\n"
+    if plain_admin:
+        text += f"**Admin:** {plain_admin}\n"
     if reason:
         text += f"**Reason:** {reason}\n"
     if extra:
@@ -670,6 +679,17 @@ def get_filter_data(message: Message):
     return None
 
 # --- MongoDB e functions ---
+def extract_plain_name(mention: str, user_id: int) -> str:
+    """Extract plain name from HTML mention like '<a href="tg://user?id=123">John</a>'."""
+    if not mention:
+        return f"User {user_id}"
+    # Try to find content between > and <
+    match = re.search(r'>([^<]+)<', mention)
+    if match:
+        return match.group(1)
+    # If no HTML tag, return as is
+    return mention
+    
 # --- Helper for owner/sudo permissions ---
 async def is_owner_or_sudo(user_id: int) -> bool:
     if user_id == OWNER_ID:
@@ -1575,11 +1595,17 @@ async def setlog_command(client: Client, message: Message):
         )
         return
 
+    # If command is used in a group (and not replying to a channel message), check owner
+    if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        if not await is_chat_owner(client, message):
+            await message.reply_text("❌ Only the group owner can use this command.")
+            return
+
     # If command is forwarded from a channel (check reply_to_message)
     if message.reply_to_message and message.reply_to_message.sender_chat:
         channel_chat = message.reply_to_message.sender_chat
         if channel_chat.type == enums.ChatType.CHANNEL:
-            # 🔒 Only group owner can set log channel
+            # Owner check (already done above, but kept for safety)
             if not await is_chat_owner(client, message):
                 return await message.reply_text("❌ Only the group owner can set the log channel.")
             
@@ -1589,7 +1615,7 @@ async def setlog_command(client: Client, message: Message):
             await message.reply_text(f"✅ Log channel set to {channel_chat.title} (ID: `{log_channel_id}`)")
             return
 
-    # Otherwise, show help
+    # Otherwise, show help (only reachable by owners now)
     await message.reply_text(
         "**How to set a log channel:**\n\n"
         "1. Add me to your channel as an admin.\n"
