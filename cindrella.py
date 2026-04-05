@@ -10293,7 +10293,8 @@ async def join_request_handler(client: Client, update: ChatJoinRequest):
         f"📥 **New Join Request**\n"
         f"👤 **Name:** {name}\n"
         f"🆔 **Username:** {username}\n"
-        f"🔢 **ID:** `{user_id}`"
+        f"🔢 **ID:** `{user_id}`\n\n"
+        f"Note - This message was automatically deleted after 10 minutes.   
     )
 
     buttons = InlineKeyboardMarkup([
