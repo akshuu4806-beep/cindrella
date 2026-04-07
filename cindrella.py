@@ -8174,100 +8174,130 @@ async def bio_and_link_scanner(client: Client, message: Message):
     if violation:
         await increment_bio_stat("caught")
 
-async def set_vc_msg(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    
-    # --- NEW: Bot must be admin and have restrict members permission ---
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin in this chat.")
-
-# Anonymous admin detection
-    if not verified and message.from_user is None and message.sender_chat:
-        if await get_anonadmin_enabled(message.chat.id):
-            return await set_vc_msg(client, message, verified=True, admin_id=0)
-        else:
-            action_id = str(uuid.uuid4())
-            pending_admin_actions[action_id] = {
-                "chat_id": message.chat.id,
-                "message": message,
-                "action": "setvcmsg",
-                "time": time.time(),
-                "used": False
-            }
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
-            ]])
-            await message.reply_text(
-                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
-                reply_markup=keyboard
-            )
-            return
-
-    if not (verified and message.from_user is None):
-        if not await require_admin(client, message):
-            return
+async def set_vc_msg(client: Client, message: Message) -> None:
+    # Only bot owner
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can use this command.")
 
     args = get_args(message)
-    await set_chat_setting(message.chat.id, "vc_msg_text", " ".join(args) if args else "Voice chat started!")
-    await message.reply_text("VC message set.")
+    if not args:
+        current = await get_chat_setting(0, "vc_msg_text", "🎙 Voice chat started!")
+        return await message.reply_text(
+            f"📋 Current global VC message:\n<code>{current}</code>\n\n"
+            f"Usage: /setvcmsg &lt;text&gt;",
+            parse_mode=enums.ParseMode.HTML
+        )
 
-async def set_vc_invite(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    # --- NEW: Bot must be admin and have restrict members permission ---
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin in this chat.")
-    
-    # Anonymous admin detection
-    if not verified and message.from_user is None and message.sender_chat:
-        if await get_anonadmin_enabled(message.chat.id):
-            return await set_vc_invite(client, message, verified=True, admin_id=0)
-        else:
-            action_id = str(uuid.uuid4())
-            pending_admin_actions[action_id] = {
-                "chat_id": message.chat.id,
-                "message": message,
-                "action": "setvcinvite",
-                "time": time.time(),
-                "used": False
-            }
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
-            ]])
-            await message.reply_text(
-                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
-                reply_markup=keyboard
-            )
-            return
+    text = " ".join(args)
+    # chat_id = 0 means global default
+    await set_chat_setting(0, "vc_msg_text", text)
+    await message.reply_text(
+        f"✅ Global VC start message set:\n<code>{text}</code>",
+        parse_mode=enums.ParseMode.HTML
+    )
 
-    if not (verified and message.from_user is None):
-        if not await require_admin(client, message):
-            return
+
+async def set_vc_invite(client: Client, message: Message) -> None:
+    # Only bot owner
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can use this command.")
 
     args = get_args(message)
-    await set_chat_setting(message.chat.id, "vc_invite_text", " ".join(args) if args else "Join VC now!")
-    await message.reply_text("VC invite message set.")
+    if not args:
+        current = await get_chat_setting(0, "vc_invite_text", "📢 Join VC now!")
+        return await message.reply_text(
+            f"📋 Current global VC invite message:\n<code>{current}</code>\n\n"
+            f"Usage: /setvcinvite &lt;text&gt;",
+            parse_mode=enums.ParseMode.HTML
+        )
 
-async def vcmsg_toggle(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    await generic_toggle(client, message, "vc_msg_enabled", "vcmsg", verified, admin_id)
+    text = " ".join(args)
+    await set_chat_setting(0, "vc_invite_text", text)
+    await message.reply_text(
+        f"✅ Global VC invite message set:\n<code>{text}</code>",
+        parse_mode=enums.ParseMode.HTML
+    )
 
-async def vcinvite_toggle(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
-    await generic_toggle(client, message, "vc_invite_enabled", "vcinvite", verified, admin_id)
+async def vcmsg_toggle(client: Client, message: Message) -> None:
+    # Only bot owner
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can use this command.")
+
+    args = get_args(message)
+    if not args or args[0].lower() not in {"on", "off"}:
+        # Show current global status
+        current = await get_chat_setting(0, "vc_msg_enabled", "1")
+        status = "✅ ON" if current == "1" else "❌ OFF"
+        return await message.reply_text(
+            f"📋 Global VC message status: <b>{status}</b>\n\n"
+            f"Usage: /vcmsg on|off",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+    enabled = "1" if args[0].lower() == "on" else "0"
+    await set_chat_setting(0, "vc_msg_enabled", enabled)
+    await message.reply_text(
+        f"✅ Global VC message {'<b>enabled</b>' if enabled == '1' else '<b>disabled</b>'} for all groups.",
+        parse_mode=enums.ParseMode.HTML
+    )
+
+
+async def vcinvite_toggle(client: Client, message: Message) -> None:
+    # Only bot owner
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Only the bot owner can use this command.")
+
+    args = get_args(message)
+    if not args or args[0].lower() not in {"on", "off"}:
+        # Show current global status
+        current = await get_chat_setting(0, "vc_invite_enabled", "1")
+        status = "✅ ON" if current == "1" else "❌ OFF"
+        return await message.reply_text(
+            f"📋 Global VC invite status: <b>{status}</b>\n\n"
+            f"Usage: /vcinvite on|off",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+    enabled = "1" if args[0].lower() == "on" else "0"
+    await set_chat_setting(0, "vc_invite_enabled", enabled)
+    await message.reply_text(
+        f"✅ Global VC invite {'<b>enabled</b>' if enabled == '1' else '<b>disabled</b>'} for all groups.",
+        parse_mode=enums.ParseMode.HTML
+    )
 
 async def vc_events(client: Client, message: Message):
     chat_id = message.chat.id
-    vc_msg_enabled = await get_chat_setting(chat_id, "vc_msg_enabled", "0") == "1"
-    vc_invite_enabled = await get_chat_setting(chat_id, "vc_invite_enabled", "0") == "1"
+
+    async def get_vc_setting(key: str, default: str) -> str:
+        val = await get_chat_setting(chat_id, key, "")
+        if not val:
+            val = await get_chat_setting(0, key, default)
+        return val
+
+    async def get_vc_toggle(key: str) -> bool:
+        # Pehle group-specific check, phir global, default = "1" (ON)
+        val = await get_chat_setting(chat_id, key, "")
+        if not val:
+            val = await get_chat_setting(0, key, "1")
+        return val == "1"
+
+    vc_msg_enabled = await get_vc_toggle("vc_msg_enabled")
+    vc_invite_enabled = await get_vc_toggle("vc_invite_enabled")
 
     if message.video_chat_started and vc_msg_enabled:
-        text = await get_chat_setting(chat_id, "vc_msg_text", "🎙 Voice chat started!")
+        text = await get_vc_setting("vc_msg_text", "🎙 Voice chat started!")
         await message.reply_text(text)
+
     elif message.video_chat_ended and vc_msg_enabled:
         await message.reply_text("🔴 Voice chat ended.")
+
     elif message.video_chat_members_invited and vc_invite_enabled:
-        text = await get_chat_setting(chat_id, "vc_invite_text", "📢 You are invited to VC!")
+        text = await get_vc_setting("vc_invite_text", "📢 You are invited to VC!")
         users = message.video_chat_members_invited.users
         user_ids = "_".join([str(u.id) for u in users])
         button = InlineKeyboardMarkup([[InlineKeyboardButton("🎙 Join VC", callback_data=f"joinvc_{user_ids}")]])
         await message.reply_text(text, reply_markup=button)
-
+        
 async def vc_started(client: Client, message: Message) -> None:
     await message.reply_text("🎙 **Voice Chat started!** Come join everyone.")
 
