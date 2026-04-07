@@ -8292,7 +8292,7 @@ async def vc_invited(client: Client, message: Message):
         )]
     ])
     await message.reply_text(
-        f"📞 **VC Invite:** {sender_name} invited {invited_names} to the Voice Chat!",
+        f"📞 {sender_name} invited {invited_names} to the Voice Chat!",
         reply_markup=keyboard
     )
 
