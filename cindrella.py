@@ -2483,6 +2483,14 @@ async def on_new_members(client: Client, message: Message) -> None:
         if member.is_bot:
             continue
 
+        # ---- Shared cache check for welcome ----
+        key = (chat_id, member.id, "welcome")
+        now = time.time()
+        if key in event_cache and now - event_cache[key] < CACHE_TTL:
+            continue
+        event_cache[key] = now
+        # ---------------------------------------
+        
         # 1. Fedban check
         banned = await check_and_punish_fedbanned_user(client, chat_id, member.id, message)
         if banned:
@@ -2539,7 +2547,7 @@ async def on_new_members(client: Client, message: Message) -> None:
                         parse_mode=enums.ParseMode.MARKDOWN
                     )
 
-        # 2. Welcome message
+     # 2. Welcome message
         settings = await get_chat_settings(chat_id)
         if settings.get("welcome_enabled", False):
             welcome_data = settings.get("welcome", {})
@@ -2550,7 +2558,7 @@ welcome_cache = {}
 CACHE_TTL = 5
 
 async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
-    # Welcome when a user becomes a member (approved joins)
+    # Welcome when a user becomes a member
     if (update.new_chat_member and 
         update.new_chat_member.status == enums.ChatMemberStatus.MEMBER and
         (update.old_chat_member is None or update.old_chat_member.status != enums.ChatMemberStatus.MEMBER)):
@@ -2558,11 +2566,14 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         if user.is_bot:
             return
         chat_id = update.chat.id
-        key = (chat_id, user.id)
+
+        # ---- Shared cache check ----
+        key = (chat_id, user.id, "welcome")
         now = time.time()
-        if key in welcome_cache and now - welcome_cache[key] < CACHE_TTL:
+        if key in event_cache and now - event_cache[key] < CACHE_TTL:
             return
-        welcome_cache[key] = now
+        event_cache[key] = now
+        # ---------------------------
 
         settings = await get_chat_settings(chat_id)
         if settings.get("welcome_enabled", False):
@@ -2598,6 +2609,28 @@ async def on_left_member(client: Client, message: Message) -> None:
     if settings.get("goodbye_enabled", False):
         goodbye_data = settings.get("goodbye", {})
         await send_welcome_goodbye(client, chat_id, user, goodbye_data)
+
+async def on_chat_member_remove(client: Client, update: ChatMemberUpdated):
+    # User left, was kicked, or banned
+    if (update.old_chat_member and 
+        update.old_chat_member.status in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR) and
+        update.new_chat_member.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED)):
+        user = update.old_chat_member.user
+        if user.is_bot:
+            return
+        chat_id = update.chat.id
+
+        # Shared cache for goodbye
+        key = (chat_id, user.id, "goodbye")
+        now = time.time()
+        if key in event_cache and now - event_cache[key] < CACHE_TTL:
+            return
+        event_cache[key] = now
+
+        settings = await get_chat_settings(chat_id)
+        if settings.get("goodbye_enabled", False):
+            goodbye_data = settings.get("goodbye", {})
+            await send_welcome_goodbye(client, chat_id, user, goodbye_data)
 
 async def setrules(client: Client, message: Message, verified=False) -> None:
     # Only groups allowed
@@ -12858,7 +12891,6 @@ def main():
     app.add_handler(CallbackQueryHandler(broadcast_confirm_callback, filters.regex(r"^(broadcast_confirm|broadcast_cancel):")))
     
     # Group handlers
-    app.add_handler(MessageHandler(on_new_members, filters.new_chat_members), group=1)
     app.add_handler(MessageHandler(on_left_member, filters.left_chat_member))
     app.add_handler(MessageHandler(vc_started, filters.video_chat_started), group=1)
     app.add_handler(MessageHandler(vc_ended, filters.video_chat_ended), group=1)
@@ -12877,7 +12909,7 @@ def main():
     app.add_handler(MessageHandler(cleanlinked_handler, filters.group), group=9)
     app.add_handler(MessageHandler(unsubscribe_fed, filters.command("unsubfed")))
     app.add_handler(MessageHandler(nightmode_handler, filters.group & ~filters.service), group=3)
-    app.add_handler(ChatMemberUpdatedHandler(on_chat_member_update))
+    app.add_handler(ChatMemberUpdatedHandler(on_chat_member_remove))
     
     
     async def start_bot():
