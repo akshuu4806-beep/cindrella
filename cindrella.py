@@ -2506,6 +2506,7 @@ async def send_welcome_goodbye(client, chat_id, user, data, reply_to_message_id=
         
 
 async def on_new_members(client: Client, message: Message) -> None:
+    print("DEBUG: on_new_members called")  # <-- add this
     chat_id = message.chat.id
     for member in message.new_chat_members:
         if member.is_bot:
@@ -12989,6 +12990,8 @@ def main():
     app.add_handler(MessageHandler(cleanlinked_handler, filters.group), group=9)
     app.add_handler(MessageHandler(unsubscribe_fed, filters.command("unsubfed")))
     app.add_handler(MessageHandler(nightmode_handler, filters.group & ~filters.service), group=3)
+    app.add_handler(MessageHandler(on_new_members, filters.new_chat_members))
+    app.add_handler(ChatMemberUpdatedHandler(on_chat_member_update))
     app.add_handler(ChatMemberUpdatedHandler(on_chat_member_remove))
     
     
