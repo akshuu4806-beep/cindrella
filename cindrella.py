@@ -4673,11 +4673,11 @@ async def skick(client: Client, message: Message, verified=False, admin_id: int 
     
     for attempt in range(2):
         try:
-        await client.unban_chat_member(message.chat.id, user.id)
-        break
-    except Exception:
-        if attempt == 0:
-            await asyncio.sleep(1)
+            await client.unban_chat_member(message.chat.id, user.id)
+            break
+        except Exception:
+            if attempt == 0:
+                await asyncio.sleep(1)
 
 async def dkick(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
