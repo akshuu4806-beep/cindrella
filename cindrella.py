@@ -3722,9 +3722,7 @@ async def do_restrict(client: Client, message: Message, mode: str) -> None:
             secs = parse_duration(args[0])
             if secs > 0:
                 until_date = int(time.time()) + secs
-        # Convert to datetime if needed
         await client.restrict_chat_member(chat_id, uid, ChatPermissions(can_send_messages=False), until_date=to_datetime(until_date))
-    
         if mode == "dmute" and message.reply_to_message:
             with suppress(Exception):
                 await message.reply_to_message.delete()
@@ -3739,23 +3737,29 @@ async def do_restrict(client: Client, message: Message, mode: str) -> None:
             secs = parse_duration(args[0])
             if secs > 0:
                 until_date = int(time.time()) + secs
-        # Convert to datetime if needed
         await client.ban_chat_member(chat_id, uid, until_date=to_datetime(until_date))
         
-        # FIX: KICK के लिए UNBAN को रिट्राई करें
+        # 🔧 FIX: KICK के लिए UNBAN को रिट्राई करें और सफलता ट्रैक करें
+        unban_success = True
         if mode in {"kick", "dkick", "skick"}:
-            for attempt in range(2):  # 2 attempts
+            unban_success = False
+            for attempt in range(2):
                 try:
                     await client.unban_chat_member(chat_id, uid)
-                    break  # success
+                    unban_success = True
+                    break
                 except Exception as e:
                     if attempt == 0:
-                        await asyncio.sleep(1)  # wait 1 second before retry
+                        await asyncio.sleep(1)
                     else:
-                        # दूसरी बार भी fail हो गया – लॉग करें या एडमिन को बताएँ
                         print(f"Unban failed for {uid} during {mode}: {e}")
-                        # आप चाहें तो यहाँ message.reply_text भी डाल सकते हैं
-        if mode not in {"sban", "skick"}:
+                        await message.reply_text(
+                            f"⚠️ {target.mention} was banned but could not be unbanned automatically. "
+                            f"Please unban manually if needed."
+                        )
+        
+        # केवल सफल होने पर ही संदेश भेजें
+        if mode not in {"sban", "skick"} and unban_success:
             action = "kicked" if mode in {"kick", "dkick", "skick"} else "banned"
             await message.reply_text(f"🚫 {target.mention} {action}.")
     if mode in {"dwarn", "dmute", "dkick"}:
