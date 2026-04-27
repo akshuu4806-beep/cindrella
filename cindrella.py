@@ -1232,9 +1232,9 @@ async def get_chat_settings(chat_id: int) -> dict:
     return {
         "chat_id": chat_id,
         "welcome": {"type": "text", "text": "Welcome {fullname}!", "file_id": None, "caption": None},
-        "welcome_enabled": False,
+        "welcome_enabled": True,
         "goodbye": {"type": "text", "text": "Goodbye {fullname}!", "file_id": None, "caption": None},
-        "goodbye_enabled": False
+        "goodbye_enabled": True
     }
 
 async def update_chat_settings(chat_id: int, **kwargs) -> None:
@@ -4599,22 +4599,21 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
     if status == "admin":
         return await message.reply_text("Can't kick admins.")
 
+    chat_id = message.chat.id
+    user_id = user.id
+
     try:
         # Ban (kicks out)
-        await client.ban_chat_member(message.chat.id, user.id)
-        for attempt in range(2):
-            try:
-                await client.unban_chat_member(message.chat.id, user.id)
-                break
-            except Exception:
-                if attempt == 0:
-                    await asyncio.sleep(1)
-                else:
-                    await message.reply_text(
-                        f"⚠️ {user.mention} was banned but could not be unbanned automatically. "
-                        f"Please unban manually if needed.\nError: {e}"
-                    )
-                    return
+        await client.ban_chat_member(chat_id, user_id)
+        # Short pause for Telegram to register
+        await asyncio.sleep(0.3)
+        # Unban (with one retry)
+        try:
+            await client.unban_chat_member(chat_id, user_id)
+        except Exception:
+            await asyncio.sleep(0.3)
+            await client.unban_chat_member(chat_id, user_id)
+
     except Exception as e:
         await message.reply_text(f"Failed to kick: {e}")
         return
@@ -4622,62 +4621,6 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
     await send_log(client, message.chat.id, "admin", "Kick", user.mention, user.id,
                    admin_mention=message.from_user.mention if message.from_user else "Anonymous")
     await message.reply_text(f"{user.mention} kicked.")
-    
-async def skick(client: Client, message: Message, verified=False, admin_id: int = None):
-    # Only groups allowed
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await message.reply_text("This command only works in groups.")
-        return
-    
-    # --- NEW: Bot must be admin and have restrict members permission ---
-    if not await bot_is_admin(client, message.chat.id):
-        return await message.reply_text("❌ I am not admin in this chat.")
-    
-    # Anonymous admin detection
-    if not verified and message.from_user is None and message.sender_chat:
-        if await get_anonadmin_enabled(message.chat.id):
-            return await skick(client, message, verified=True, admin_id=0)
-        else:
-            action_id = str(uuid.uuid4())
-            pending_admin_actions[action_id] = {
-                "chat_id": message.chat.id,
-                "message": message,
-                "action": "skick",
-                "time": time.time(),
-                "used": False
-            }
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
-            ]])
-            await message.reply_text(
-                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
-                reply_markup=keyboard
-            )
-            return
-
-    # Admin check for non‑verified or regular admins
-    if not (verified and message.from_user is None):
-        if not await require_admin(client, message):
-            return
-
-    if not await check_ban_permissions(client, message):
-        return
-
-    user = await get_target_user(client, message)
-    if not user:
-        await message.reply_text("User not found.")
-        return
-
-    await client.ban_chat_member(message.chat.id, user.id)
-    await send_log(client, message.chat.id, "admin", "Kick (silent)", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
-    
-    for attempt in range(2):
-        try:
-            await client.unban_chat_member(message.chat.id, user.id)
-            break
-        except Exception:
-            if attempt == 0:
-                await asyncio.sleep(1)
 
 async def dkick(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
@@ -4732,19 +4675,13 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
             await message.reply_text(f"Could not delete replied message: {e}")
 
     try:
-        await client.ban_chat_member(message.chat.id, user.id)
-        for attempt in range(2):
-            try:
-                await client.unban_chat_member(message.chat.id, user.id)
-                break
-            except Exception:
-                if attempt == 0:
-                    await asyncio.sleep(1)
-                else:
-                    await message.reply_text(
-                        f"⚠️ {user.mention} was banned but could not be unbanned. Please unban manually if needed.\nError: {e}"
-                    )
-                    return
+        await client.ban_chat_member(chat_id, user_id)
+        await asyncio.sleep(0.3)
+        try:
+            await client.unban_chat_member(chat_id, user_id)
+        except Exception:
+            await asyncio.sleep(0.3)
+            await client.unban_chat_member(chat_id, user_id)
     except Exception as e:
         await message.reply_text(f"❌ Failed to kick: {e}")
         return
@@ -4757,7 +4694,67 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
         pass
 
     await message.reply_text(f"{user.mention} kicked and message deleted.")
+
+async def skick(client: Client, message: Message, verified=False, admin_id: int = None):
+    # Only groups allowed
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("This command only works in groups.")
+        return
     
+    if not await bot_is_admin(client, message.chat.id):
+        return await message.reply_text("❌ I am not admin in this chat.")
+    
+    if not verified and message.from_user is None and message.sender_chat:
+        if await get_anonadmin_enabled(message.chat.id):
+            return await skick(client, message, verified=True, admin_id=0)
+        else:
+            action_id = str(uuid.uuid4())
+            pending_admin_actions[action_id] = {
+                "chat_id": message.chat.id,
+                "message": message,
+                "action": "skick",
+                "time": time.time(),
+                "used": False
+            }
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Click To Prove Admin", callback_data=f"prove_admin:{action_id}")
+            ]])
+            await message.reply_text(
+                "⚠️ Anonymous admin detected.\nPress button to confirm admin identity.",
+                reply_markup=keyboard
+            )
+            return
+
+    if not (verified and message.from_user is None):
+        if not await require_admin(client, message):
+            return
+
+    if not await check_ban_permissions(client, message):
+        return
+
+    user = await get_target_user(client, message)
+    if not user:
+        await message.reply_text("User not found.")
+        return
+
+    chat_id = message.chat.id
+    user_id = user.id
+
+    try:
+        await client.ban_chat_member(chat_id, user_id)
+        await asyncio.sleep(0.3)
+        try:
+            await client.unban_chat_member(chat_id, user_id)
+        except Exception:
+            await asyncio.sleep(0.3)
+            await client.unban_chat_member(chat_id, user_id)
+    except Exception as e:
+        await message.reply_text(f"Failed to silent kick: {e}")
+        return
+
+    await send_log(client, message.chat.id, "admin", "Kick (silent)", user.mention, user.id,
+                   admin_mention=message.from_user.mention if message.from_user else "Anonymous")
+    # No reply message (silent)
 
 async def kickme(client: Client, message: Message) -> None:
     # Only groups allowed
@@ -4765,15 +4762,36 @@ async def kickme(client: Client, message: Message) -> None:
         await message.reply_text("This command only works in groups.")
         return
     
+    # Bot must be admin
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin.")
     
+    # Bot must have ban permission
     if not await bot_has_permission(client, message.chat.id, "can_restrict_members"):
         await message.reply_text("I don't have the right to kick members. Please give me admin with restrict permission.")
         return
+
     uid = message.from_user.id
-    await client.ban_chat_member(message.chat.id, uid)
-    await client.unban_chat_member(message.chat.id, uid)
+    chat_id = message.chat.id
+
+    try:
+        # 1) Ban the user (kicks them out)
+        await client.ban_chat_member(chat_id, uid)
+        
+        # 2) Short pause (0.3s) for Telegram to register
+        await asyncio.sleep(0.3)
+        
+        # 3) Unban – with one retry if needed
+        try:
+            await client.unban_chat_member(chat_id, uid)
+        except Exception:
+            await asyncio.sleep(0.3)
+            await client.unban_chat_member(chat_id, uid)
+            
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to kick you: {e}")
+        return
+
     await message.reply_text("You have left the group.")
 
 async def lock(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
