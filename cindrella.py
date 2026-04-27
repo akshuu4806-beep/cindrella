@@ -2609,6 +2609,7 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
             await send_welcome_goodbye(client, chat_id, user, welcome_data)    
 # Simple cache to prevent duplicate goodbye messages
 goodbye_cache = {}
+event_cache = {}
 CACHE_TTL = 5  # seconds
 
 async def on_left_member(client: Client, message: Message) -> None:
@@ -4601,14 +4602,13 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
     try:
         # Ban (kicks out)
         await client.ban_chat_member(message.chat.id, user.id)
-        # Unban with retry
         for attempt in range(2):
             try:
                 await client.unban_chat_member(message.chat.id, user.id)
                 break
-            except Exception as e:
+            except Exception:
                 if attempt == 0:
-                    await asyncio.sleep(1)  # wait before retry
+                    await asyncio.sleep(1)
                 else:
                     await message.reply_text(
                         f"⚠️ {user.mention} was banned but could not be unbanned automatically. "
@@ -4670,7 +4670,14 @@ async def skick(client: Client, message: Message, verified=False, admin_id: int 
 
     await client.ban_chat_member(message.chat.id, user.id)
     await send_log(client, message.chat.id, "admin", "Kick (silent)", user.mention, user.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous")
-    await client.unban_chat_member(message.chat.id, user.id)
+    
+    for attempt in range(2):
+        try:
+        await client.unban_chat_member(message.chat.id, user.id)
+        break
+    except Exception:
+        if attempt == 0:
+            await asyncio.sleep(1)
 
 async def dkick(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
@@ -4725,12 +4732,12 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
             await message.reply_text(f"Could not delete replied message: {e}")
 
     try:
-        await client.ban_chat_member(chat_id, user_id)
+        await client.ban_chat_member(message.chat.id, user.id)
         for attempt in range(2):
             try:
-                await client.unban_chat_member(chat_id, user_id)
+                await client.unban_chat_member(message.chat.id, user.id)
                 break
-            except Exception as e:
+            except Exception:
                 if attempt == 0:
                     await asyncio.sleep(1)
                 else:
