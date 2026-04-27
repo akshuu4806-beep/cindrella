@@ -2602,12 +2602,7 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         if key in event_cache and now - event_cache[key] < CACHE_TTL:
             return
         event_cache[key] = now
-        # ---------------------------
-
-        settings = await get_chat_settings(chat_id)
-        if settings.get("welcome_enabled", False):
-            welcome_data = settings.get("welcome", {})
-            await send_welcome_goodbye(client, chat_id, user, welcome_data)    
+        # ---------------------------   
 # Simple cache to prevent duplicate goodbye messages
 goodbye_cache = {}
 event_cache = {}
