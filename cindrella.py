@@ -2607,7 +2607,7 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         settings = await get_chat_settings(chat_id)
         if settings.get("welcome_enabled", False):
             welcome_data = settings.get("welcome", {})
-            await send_welcome_goodbye(client, chat_id, user, welcome_data, reply_to_message_id=message.id)    
+            await send_welcome_goodbye(client, chat_id, user, welcome_data)    
 # Simple cache to prevent duplicate goodbye messages
 goodbye_cache = {}
 event_cache = {}
