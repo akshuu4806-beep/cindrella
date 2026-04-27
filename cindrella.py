@@ -1232,9 +1232,9 @@ async def get_chat_settings(chat_id: int) -> dict:
     return {
         "chat_id": chat_id,
         "welcome": {"type": "text", "text": "Welcome {fullname}!", "file_id": None, "caption": None},
-        "welcome_enabled": True,
+        "welcome_enabled": False,
         "goodbye": {"type": "text", "text": "Goodbye {fullname}!", "file_id": None, "caption": None},
-        "goodbye_enabled": True
+        "goodbye_enabled": False
     }
 
 async def update_chat_settings(chat_id: int, **kwargs) -> None:
