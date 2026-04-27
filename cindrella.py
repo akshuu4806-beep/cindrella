@@ -2607,7 +2607,7 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         settings = await get_chat_settings(chat_id)
         if settings.get("welcome_enabled", False):
             welcome_data = settings.get("welcome", {})
-            await send_welcome_goodbye(client, chat_id, user, welcome_data)    
+            await send_welcome_goodbye(client, chat_id, user, welcome_data, reply_to_message_id=message.id)    
 # Simple cache to prevent duplicate goodbye messages
 goodbye_cache = {}
 event_cache = {}
@@ -2638,7 +2638,7 @@ async def on_left_member(client: Client, message: Message) -> None:
     settings = await get_chat_settings(chat_id)
     if settings.get("goodbye_enabled", False):
         goodbye_data = settings.get("goodbye", {})
-        await send_welcome_goodbye(client, chat_id, user, goodbye_data)
+        await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message.id)
 
 async def on_chat_member_remove(client: Client, update: ChatMemberUpdated):
     # User left, was kicked, or banned
@@ -2660,7 +2660,7 @@ async def on_chat_member_remove(client: Client, update: ChatMemberUpdated):
         settings = await get_chat_settings(chat_id)
         if settings.get("goodbye_enabled", False):
             goodbye_data = settings.get("goodbye", {})
-            await send_welcome_goodbye(client, chat_id, user, goodbye_data)
+            await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message.id)
 
 async def setrules(client: Client, message: Message, verified=False) -> None:
     # Only groups allowed
