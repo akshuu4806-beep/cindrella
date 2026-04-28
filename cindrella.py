@@ -2625,7 +2625,26 @@ event_cache = {}
 CACHE_TTL = 2  # seconds
 
 async def on_left_member(client: Client, message: Message) -> None:
-    pass
+    """Handle manual leave via service message."""
+    # Skip if the user who left is a bot
+    user = message.left_chat_member
+    if user.is_bot:
+        return
+
+    chat_id = message.chat.id
+
+    # Cache check to avoid duplicate sends (same as welcome)
+    key = (chat_id, user.id, "goodbye")
+    now = time.time()
+    if key in event_cache and now - event_cache[key] < CACHE_TTL:
+        return
+    event_cache[key] = now
+
+    # Get chat settings and check if goodbye is enabled
+    settings = await get_chat_settings(chat_id)
+    if settings.get("goodbye_enabled", False):
+        goodbye_data = settings.get("goodbye", {})
+        await send_welcome_goodbye(client, chat_id, user, goodbye_data)
     
 async def on_chat_member_remove(client: Client, update: ChatMemberUpdated):
     # User left, was kicked, or banned
