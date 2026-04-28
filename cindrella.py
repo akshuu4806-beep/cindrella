@@ -1410,6 +1410,44 @@ def target_user(message: Message) -> int | None:
         return message.reply_to_message.from_user.id
     return None
 
+async def get_user_from_identifier(client, chat_id, identifier):
+    """एकल identifier (ID, @username, या पूरा नाम) से user ढूंढ़े"""
+    # User ID (सिर्फ digits)
+    if identifier.isdigit():
+        try:
+            return await client.get_users(int(identifier))
+        except:
+            pass
+    # @username – @ हटाएँ
+    if identifier.startswith('@'):
+        identifier = identifier[1:]
+    try:
+        return await client.get_users(identifier)
+    except:
+        pass
+    # Full name match – active users cache में देखें
+    full_name = identifier.lower().strip()
+    for uid in list(active_users.get(chat_id, deque())):
+        try:
+            user = await client.get_users(uid)
+            name = f"{user.first_name} {user.last_name or ''}".strip().lower()
+            if name == full_name:
+                return user
+        except:
+            continue
+    # Finally – सभी members पर loop
+    try:
+        async for member in client.get_chat_members(chat_id):
+            user = member.user
+            if user.is_bot or user.is_deleted:
+                continue
+            name = f"{user.first_name} {user.last_name or ''}".strip().lower()
+            if name == full_name:
+                return user
+    except:
+        pass
+    return None
+
 # ----- Update get_target_user -----
 async def get_target_user(client: Client, message: Message):
     """Extract user from reply, user ID, username, or full name mention."""
@@ -5660,13 +5698,29 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text("I don't have the right to promote members. Please give me admin with 'Add Admins' permission.")
         return
 
-    target = await get_target_user(client, message)
-    if not target:
-        await message.reply_text("User not found.")
-        return
+    # ============= FIX START: Extract target and title =============
+    target = None
+    title = None
 
-    args = get_args(message)
-    title = " ".join(args[1:]) if len(args) > 1 else None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+        args = get_args(message)   # remaining args become title
+        if args:
+            title = " ".join(args)
+    else:
+        args = get_args(message)
+        if not args:
+            await message.reply_text("Usage: /promote <reply/username/mention/userid> [title]")
+            return
+        # First argument = user identifier
+        target = await get_user_from_identifier(client, message.chat.id, args[0])
+        if not target:
+            await message.reply_text("User not found.")
+            return
+        # Rest = title
+        if len(args) > 1:
+            title = " ".join(args[1:])
+    # ============= FIX END =============
 
     # --- NEW: Get bot's own privileges to copy ---
     bot_me = await client.get_me()
@@ -5686,7 +5740,6 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
     valid_params = set(sig.parameters.keys())
     valid_params.discard('self')
     
-    # Build dictionary with known fields
     priv_dict = {
         'can_manage_chat': privs.can_manage_chat,
         'can_delete_messages': privs.can_delete_messages,
@@ -5695,7 +5748,6 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         'can_pin_messages': privs.can_pin_messages,
         'can_promote_members': False,
     }
-    # Add optional fields if they exist in both bot's privileges and are accepted by ChatPrivileges
     for attr in ['can_manage_video_chats', 'can_manage_stories']:
         if attr in valid_params and hasattr(privs, attr):
             priv_dict[attr] = getattr(privs, attr, False)
