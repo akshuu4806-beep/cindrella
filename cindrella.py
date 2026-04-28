@@ -2576,65 +2576,57 @@ async def on_new_members(client: Client, message: Message) -> None:
                         parse_mode=enums.ParseMode.MARKDOWN
                     )
 
-     # 2. Welcome message
-        settings = await get_chat_settings(chat_id)
-        if settings.get("welcome_enabled", False):
-            welcome_data = settings.get("welcome", {})
-            await send_welcome_goodbye(client, chat_id, member, welcome_data, reply_to_message_id=message.id)
-
-# Cache to prevent duplicates
-welcome_cache = {}
-CACHE_TTL = 5
-
 async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
-    # Welcome when a user becomes a member
+    # JOIN detection
     if (update.new_chat_member and 
         update.new_chat_member.status == enums.ChatMemberStatus.MEMBER and
-        (update.old_chat_member is None or update.old_chat_member.status != enums.ChatMemberStatus.MEMBER)):
+        (update.old_chat_member is None or 
+         update.old_chat_member.status not in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER))):
+        
         user = update.new_chat_member.user
         if user.is_bot:
             return
         chat_id = update.chat.id
 
-        # ---- Shared cache check ----
         key = (chat_id, user.id, "welcome")
         now = time.time()
         if key in event_cache and now - event_cache[key] < CACHE_TTL:
             return
         event_cache[key] = now
+
+        settings = await get_chat_settings(chat_id)
+        if settings.get("welcome_enabled", False):
+            await send_welcome_goodbye(client, chat_id, user, settings.get("welcome", {}))
+
+    # LEAVE / KICK / BAN detection
+    elif (update.old_chat_member and 
+          update.old_chat_member.status in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR) and
+          update.new_chat_member.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED)):
+        
+        user = update.old_chat_member.user
+        if user.is_bot:
+            return
+        chat_id = update.chat.id
+
+        key = (chat_id, user.id, "goodbye")
+        now = time.time()
+        if key in event_cache and now - event_cache[key] < CACHE_TTL:
+            return
+        event_cache[key] = now
+
+        settings = await get_chat_settings(chat_id)
+        if settings.get("goodbye_enabled", False):
+            await send_welcome_goodbye(client, chat_id, user, settings.get("goodbye", {}))
         # ---------------------------   
 # Simple cache to prevent duplicate goodbye messages
 goodbye_cache = {}
+welcome_cache = {}
 event_cache = {}
-CACHE_TTL = 5  # seconds
+CACHE_TTL = 2  # seconds
 
 async def on_left_member(client: Client, message: Message) -> None:
-    """
-    Sends goodbye message when a user leaves the group, is kicked, or banned.
-    """
-    # Only process if it's a left member event
-    if not message.left_chat_member:
-        return
-
-    user = message.left_chat_member
-    if user.is_bot:
-        return
-
-    chat_id = message.chat.id
-
-    # Deduplication: avoid double messages if both service message and ChatMemberUpdated fire
-    key = (chat_id, user.id)
-    now = time.time()
-    if key in goodbye_cache and now - goodbye_cache[key] < CACHE_TTL:
-        return
-    goodbye_cache[key] = now
-
-    # Send goodbye message if enabled
-    settings = await get_chat_settings(chat_id)
-    if settings.get("goodbye_enabled", False):
-        goodbye_data = settings.get("goodbye", {})
-        await send_welcome_goodbye(client, chat_id, user, goodbye_data, reply_to_message_id=message.id)
-
+    pass
+    
 async def on_chat_member_remove(client: Client, update: ChatMemberUpdated):
     # User left, was kicked, or banned
     if (update.old_chat_member and 
@@ -4614,6 +4606,12 @@ async def kick(client: Client, message: Message, verified=False, admin_id: int =
             await asyncio.sleep(0.3)
             await client.unban_chat_member(chat_id, user_id)
 
+            # INKE BAAD YEH JOD DO:
+            key_join = (chat_id, user_id, "welcome")
+            key_leave = (chat_id, user_id, "goodbye")
+            if key_join in event_cache: del event_cache[key_join]
+            if key_leave in event_cache: del event_cache[key_leave]
+    
     except Exception as e:
         await message.reply_text(f"Failed to kick: {e}")
         return
@@ -4682,6 +4680,13 @@ async def dkick(client: Client, message: Message, verified=False, admin_id: int 
         except Exception:
             await asyncio.sleep(0.3)
             await client.unban_chat_member(chat_id, user_id)
+
+            # INKE BAAD YEH JOD DO:
+            key_join = (chat_id, user_id, "welcome")
+            key_leave = (chat_id, user_id, "goodbye")
+            if key_join in event_cache: del event_cache[key_join]
+            if key_leave in event_cache: del event_cache[key_leave]
+    
     except Exception as e:
         await message.reply_text(f"❌ Failed to kick: {e}")
         return
@@ -4748,6 +4753,13 @@ async def skick(client: Client, message: Message, verified=False, admin_id: int 
         except Exception:
             await asyncio.sleep(0.3)
             await client.unban_chat_member(chat_id, user_id)
+    
+            # INKE BAAD YEH JOD DO:
+            key_join = (chat_id, user_id, "welcome")
+            key_leave = (chat_id, user_id, "goodbye")
+            if key_join in event_cache: del event_cache[key_join]
+            if key_leave in event_cache: del event_cache[key_leave]
+                
     except Exception as e:
         await message.reply_text(f"Failed to silent kick: {e}")
         return
@@ -4787,7 +4799,13 @@ async def kickme(client: Client, message: Message) -> None:
         except Exception:
             await asyncio.sleep(0.3)
             await client.unban_chat_member(chat_id, uid)
-            
+
+            # INKE BAAD YEH JOD DO:
+            key_join = (chat_id, user_id, "welcome")
+            key_leave = (chat_id, user_id, "goodbye")
+            if key_join in event_cache: del event_cache[key_join]
+            if key_leave in event_cache: del event_cache[key_leave]
+    
     except Exception as e:
         await message.reply_text(f"❌ Failed to kick you: {e}")
         return
