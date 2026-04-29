@@ -7896,28 +7896,25 @@ async def anonadmin_command(client: Client, message: Message, verified=False, ad
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
 
-
     # Anonymous admin detection for owner verification
     if not verified and message.from_user is None and message.sender_chat:
-        if await get_anonadmin_enabled(message.chat.id):
-            return await anonadmin_command(client, message, verified=True, admin_id=0)
-        else:
-            action_id = str(uuid.uuid4())
-            pending_admin_actions[action_id] = {
-                "chat_id": message.chat.id,
-                "message": message,
-                "action": "anonadmin",
-                "time": time.time(),
-                "used": False
-            }
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Click To Prove Owner", callback_data=f"prove_admin:{action_id}")
-            ]])
-            await message.reply_text(
-                "⚠️ Anonymous admin detected.\nPress button to confirm you are the group owner.",
-                reply_markup=keyboard
-            )
-            return
+        # हमेशा prove करने का बटन दिखाएँ – कोई bypass नहीं
+        action_id = str(uuid.uuid4())
+        pending_admin_actions[action_id] = {
+            "chat_id": message.chat.id,
+            "message": message,
+            "action": "anonadmin",
+            "time": time.time(),
+            "used": False
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Click To Prove Owner", callback_data=f"prove_admin:{action_id}")
+        ]])
+        await message.reply_text(
+            "⚠️ Anonymous admin detected.\nPress button to confirm you are the group owner.",
+            reply_markup=keyboard
+        )
+        return
 
     # For normal users, check if they are owner
     user_id = admin_id if admin_id else (message.from_user.id if message.from_user else None)
@@ -7958,7 +7955,7 @@ async def anonadmin_command(client: Client, message: Message, verified=False, ad
         reply_markup=keyboard,
         parse_mode=enums.ParseMode.MARKDOWN
     )
-
+    
 async def nightmode_cmd(client: Client, message: Message, verified=False, admin_id: int = None):
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
