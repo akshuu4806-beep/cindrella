@@ -5647,10 +5647,11 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text("This command only works in groups.")
         return
 
-    # --- NEW: Bot must be admin and have restrict members permission ---
+    # --- Bot must be admin and have promote permission ---
     if not await bot_is_admin(client, message.chat.id):
         return await message.reply_text("❌ I am not admin in this chat.")
 
+    # Anonymous admin detection
     if not verified and message.from_user is None and message.sender_chat:
         if await get_anonadmin_enabled(message.chat.id):
             return await promote(client, message, verified=True, admin_id=0)
@@ -5672,12 +5673,12 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
             )
             return
 
-    # Admin check - only for non-verified
+    # Admin check for non-verified
     if not (verified and message.from_user is None):
         if not await require_admin(client, message):
             return
 
-    # Determine the user ID for permission checks
+    # Determine user ID for permission checks
     if admin_id is not None:
         user_id = admin_id
     elif message.from_user:
@@ -5688,20 +5689,20 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
 
     # For verified anonymous admin (user_id == 0), skip permission checks
     if user_id != 0:
-        # Check if user has permission to promote
         if not await user_has_permission(client, message.chat.id, user_id, "can_promote_members"):
             await message.reply_text("❌ You don't have permission to add admins.")
             return
 
-    # Check if bot has permission to promote
+    # Bot permission to promote
     if not await bot_has_permission(client, message.chat.id, "can_promote_members"):
         await message.reply_text("I don't have the right to promote members. Please give me admin with 'Add Admins' permission.")
         return
 
-    # ============= FIX START: Extract target and title =============
+    # ============= FIX: Extract target and title =============
     target = None
     title = None
 
+    # Case 1: Reply to a message
     if message.reply_to_message:
         target = message.reply_to_message.from_user
         args = get_args(message)   # remaining args become title
@@ -5712,17 +5713,31 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         if not args:
             await message.reply_text("Usage: /promote <reply/username/mention/userid> [title]")
             return
-        # First argument = user identifier
-        target = await get_user_from_identifier(client, message.chat.id, args[0])
-        if not target:
+
+        # Try to parse user from the FIRST argument ONLY (supports ID, @username, or full name with spaces)
+        user_identifier = args[0].strip()
+        target = await get_user_from_identifier(client, message.chat.id, user_identifier)
+        
+        # If not found by first argument, try the whole joined string (for multi-word full name)
+        if not target and len(args) > 1:
+            full_name_identifier = " ".join(args).strip()
+            target = await get_user_from_identifier(client, message.chat.id, full_name_identifier)
+            if target:
+                # If found by full name, then title is empty (no extra args)
+                title = None
+            else:
+                await message.reply_text("User not found.")
+                return
+        elif not target:
             await message.reply_text("User not found.")
             return
-        # Rest = title
-        if len(args) > 1:
-            title = " ".join(args[1:])
-    # ============= FIX END =============
 
-    # --- NEW: Get bot's own privileges to copy ---
+        # If target found by first argument and there are more args, rest become title
+        if target and len(args) > 1:
+            title = " ".join(args[1:])
+    # ============= END FIX =============
+
+    # --- Copy bot's own privileges (excluding can_promote_members) ---
     bot_me = await client.get_me()
     bot_member = await client.get_chat_member(message.chat.id, bot_me.id)
     if bot_member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
@@ -5732,7 +5747,6 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         await message.reply_text("❌ I don't have any admin privileges to copy.")
         return
 
-    # Copy all privileges except can_promote_members
     import inspect
     from pyrogram.types import ChatPrivileges
     privs = bot_member.privileges
@@ -5762,11 +5776,13 @@ async def promote(client: Client, message: Message, verified=False, admin_id: in
         if title:
             try:
                 await client.set_administrator_title(message.chat.id, target.id, title)
-            except:
-                pass
-        await message.reply_text(f"Promoted! {title}")
+                await message.reply_text(f"✅ Promoted {target.mention} with title: {title}")
+            except Exception as e:
+                await message.reply_text(f"✅ Promoted {target.mention}, but could not set title: {e}")
+        else:
+            await message.reply_text(f"✅ Promoted {target.mention} (no title).")
     except Exception as e:
-        await message.reply_text(f"Failed to promote: {e}")
+        await message.reply_text(f"❌ Failed to promote: {e}")
         extra = f"Title: {title}" if title else None
         await send_log(client, message.chat.id, "admin", "Promote", target.mention, target.id, admin_mention=message.from_user.mention if message.from_user else "Anonymous", extra=extra)
         
