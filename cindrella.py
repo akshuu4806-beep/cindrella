@@ -2256,37 +2256,149 @@ async def setwelcome(client: Client, message: Message, verified=False) -> None:
 
     if reply:
         if reply.photo:
-            data = {'type': 'photo', 'file_id': reply.photo.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            # Validate button limit
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'photo',
+                'file_id': reply.photo.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.video:
-            data = {'type': 'video', 'file_id': reply.video.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'video',
+                'file_id': reply.video.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.sticker:
+            # Sticker doesn't support caption, so no buttons possible
             data = {'type': 'sticker', 'file_id': reply.sticker.file_id, 'caption': ""}
+
         elif reply.animation:
-            data = {'type': 'animation', 'file_id': reply.animation.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'animation',
+                'file_id': reply.animation.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.document:
-            data = {'type': 'document', 'file_id': reply.document.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'document',
+                'file_id': reply.document.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.voice:
+            # Voice has no caption support normally, but we keep as is
             data = {'type': 'voice', 'file_id': reply.voice.file_id, 'caption': ""}
+
         elif reply.audio:
-            data = {'type': 'audio', 'file_id': reply.audio.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'audio',
+                'file_id': reply.audio.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.text:
-            data = {'type': 'text', 'text': reply.text, 'file_id': None, 'caption': None}
+            raw_text = reply.text
+            clean_text, button_rows = parse_button(raw_text)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons.")
+                return
+            data = {
+                'type': 'text',
+                'text': clean_text,
+                'file_id': None,
+                'caption': None
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         else:
             args = get_args(message)
             if args:
-                data = {'type': 'text', 'text': " ".join(args)}
+                raw_text = " ".join(args)
+                clean_text, button_rows = parse_button(raw_text)
+                total_buttons = sum(len(row) for row in button_rows)
+                if total_buttons > 15:
+                    await message.reply_text("❌ You can add at most 15 buttons.")
+                    return
+                data = {
+                    'type': 'text',
+                    'text': clean_text,
+                    'file_id': None,
+                    'caption': None
+                }
+                if button_rows:
+                    data['buttons'] = button_rows
             else:
                 await message.reply_text("Usage: /setwelcome with text or reply to a media/text message")
                 return
+
     else:
         args = get_args(message)
         if not args:
             await message.reply_text("Usage: /setwelcome <text> or reply to a message with /setwelcome")
             return
-        data = {'type': 'text', 'text': " ".join(args)}
+        raw_text = " ".join(args)
+        clean_text, button_rows = parse_button(raw_text)
+        total_buttons = sum(len(row) for row in button_rows)
+        if total_buttons > 15:
+            await message.reply_text("❌ You can add at most 15 buttons.")
+            return
+        data = {
+            'type': 'text',
+            'text': clean_text,
+            'file_id': None,
+            'caption': None
+        }
+        if button_rows:
+            data['buttons'] = button_rows
 
     await update_chat_settings(message.chat.id, welcome=data, welcome_enabled=True)
     await message.reply_text("✅ Welcome message set and enabled.")
+    
 
 async def resetwelcome(client: Client, message: Message, verified=False) -> None:
     # Only groups allowed
@@ -2398,38 +2510,148 @@ async def setgoodbye(client: Client, message: Message, verified=False) -> None:
 
     if reply:
         if reply.photo:
-            data = {'type': 'photo', 'file_id': reply.photo.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'photo',
+                'file_id': reply.photo.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.video:
-            data = {'type': 'video', 'file_id': reply.video.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'video',
+                'file_id': reply.video.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.sticker:
+            # Sticker doesn't support caption, so no buttons possible
             data = {'type': 'sticker', 'file_id': reply.sticker.file_id, 'caption': ""}
+
         elif reply.animation:
-            data = {'type': 'animation', 'file_id': reply.animation.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'animation',
+                'file_id': reply.animation.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.document:
-            data = {'type': 'document', 'file_id': reply.document.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'document',
+                'file_id': reply.document.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.voice:
+            # Voice has no caption support normally, but we keep as is
             data = {'type': 'voice', 'file_id': reply.voice.file_id, 'caption': ""}
+
         elif reply.audio:
-            data = {'type': 'audio', 'file_id': reply.audio.file_id, 'caption': reply.caption or ""}
+            caption = reply.caption or ""
+            clean_caption, button_rows = parse_button(caption)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons in caption.")
+                return
+            data = {
+                'type': 'audio',
+                'file_id': reply.audio.file_id,
+                'caption': clean_caption
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         elif reply.text:
-            data = {'type': 'text', 'text': reply.text, 'file_id': None, 'caption': None}
+            raw_text = reply.text
+            clean_text, button_rows = parse_button(raw_text)
+            total_buttons = sum(len(row) for row in button_rows)
+            if total_buttons > 15:
+                await message.reply_text("❌ You can add at most 15 buttons.")
+                return
+            data = {
+                'type': 'text',
+                'text': clean_text,
+                'file_id': None,
+                'caption': None
+            }
+            if button_rows:
+                data['buttons'] = button_rows
+
         else:
             args = get_args(message)
             if args:
-                data = {'type': 'text', 'text': " ".join(args)}
+                raw_text = " ".join(args)
+                clean_text, button_rows = parse_button(raw_text)
+                total_buttons = sum(len(row) for row in button_rows)
+                if total_buttons > 15:
+                    await message.reply_text("❌ You can add at most 15 buttons.")
+                    return
+                data = {
+                    'type': 'text',
+                    'text': clean_text,
+                    'file_id': None,
+                    'caption': None
+                }
+                if button_rows:
+                    data['buttons'] = button_rows
             else:
                 await message.reply_text("Usage: /setgoodbye with text or reply to a media/text message")
                 return
+
     else:
         args = get_args(message)
         if not args:
             await message.reply_text("Usage: /setgoodbye <text> or reply to a message with /setgoodbye")
             return
-        data = {'type': 'text', 'text': " ".join(args)}
+        raw_text = " ".join(args)
+        clean_text, button_rows = parse_button(raw_text)
+        total_buttons = sum(len(row) for row in button_rows)
+        if total_buttons > 15:
+            await message.reply_text("❌ You can add at most 15 buttons.")
+            return
+        data = {
+            'type': 'text',
+            'text': clean_text,
+            'file_id': None,
+            'caption': None
+        }
+        if button_rows:
+            data['buttons'] = button_rows
 
     await update_chat_settings(message.chat.id, goodbye=data, goodbye_enabled=True)
     await message.reply_text("✅ Goodbye message set and enabled.")
-
+    
 async def resetgoodbye(client: Client, message: Message, verified=False) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -2519,30 +2741,86 @@ async def send_welcome_goodbye(client, chat_id, user, data, reply_to_message_id=
     msg_type = data.get('type', 'text')
     file_id = data.get('file_id')
 
+    # Create reply_markup if buttons exist
+    reply_markup = None
+    if data.get("buttons"):
+        reply_markup = InlineKeyboardMarkup(data["buttons"])
+
     try:
         if msg_type == 'photo' and file_id:
-            await client.send_photo(chat_id, file_id, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            await client.send_photo(
+                chat_id, file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
+            )
         elif msg_type == 'video' and file_id:
-            await client.send_video(chat_id, file_id, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            await client.send_video(
+                chat_id, file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
+            )
         elif msg_type == 'sticker' and file_id:
+            # Sticker doesn't support reply_markup, so send sticker without buttons
             await client.send_sticker(chat_id, file_id, reply_to_message_id=reply_to_message_id)
+            # If there is a caption, send it as a separate message with buttons
             if caption:
-                await client.send_message(chat_id, caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+                await client.send_message(
+                    chat_id, caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=reply_markup
+                )
         elif msg_type == 'animation' and file_id:
-            await client.send_animation(chat_id, file_id, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            await client.send_animation(
+                chat_id, file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
+            )
         elif msg_type == 'document' and file_id:
-            await client.send_document(chat_id, file_id, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            await client.send_document(
+                chat_id, file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
+            )
         elif msg_type == 'voice' and file_id:
-            await client.send_voice(chat_id, file_id, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            # Voice message doesn't support reply_markup or caption reliably
+            await client.send_voice(chat_id, file_id, reply_to_message_id=reply_to_message_id)
+            # If caption exists, send as separate text with buttons
+            if caption:
+                await client.send_message(
+                    chat_id, caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=reply_markup
+                )
         elif msg_type == 'audio' and file_id:
-            await client.send_audio(chat_id, file_id, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            await client.send_audio(
+                chat_id, file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
+            )
         else:
-            await client.send_message(chat_id, caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+            # Plain text message
+            await client.send_message(
+                chat_id, caption,
+                parse_mode=enums.ParseMode.HTML,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
+            )
     except Exception as e:
         print(f"Error sending: {e}")
-        await client.send_message(chat_id, caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=reply_to_message_id)
+        # Fallback: send only text (without buttons) if anything fails
+        await client.send_message(
+            chat_id, caption,
+            parse_mode=enums.ParseMode.HTML,
+            reply_to_message_id=reply_to_message_id
+        )
         
-
 async def on_new_members(client: Client, message: Message) -> None:
     print("DEBUG: on_new_members called")  # <-- add this
     chat_id = message.chat.id
