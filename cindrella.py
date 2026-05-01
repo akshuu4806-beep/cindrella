@@ -7922,7 +7922,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 def parse_button(text: str):
     """Parse button syntax: [Text](buttonurl:link)"""
-    pattern = r'\[(.*?)\]\(buttonurl:(.*?)\)'
+    pattern = r'\[(.*?)\]\(buttonurl:(.*?)\)'   # <-- colon ke baad ka URL capture
     buttons = []
     lines = text.split('\n')
     new_text = []
@@ -7931,13 +7931,14 @@ def parse_button(text: str):
         if matches:
             row = []
             for name, url in matches:
-                row.append(InlineKeyboardButton(name, url=url))
+                row.append(InlineKeyboardButton(name, url=url))   # ab url clean hai
                 # Remove the button markup from line
                 line = line.replace(f'[{name}](buttonurl:{url})', '').strip()
             buttons.append(row)
         new_text.append(line)
     clean_text = '\n'.join(new_text).strip()
     return clean_text, buttons
+    
 
 async def permapin_command(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
