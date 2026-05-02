@@ -7922,7 +7922,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 def parse_button(text: str):
     """Parse button syntax: [Text](buttonurl:link)"""
-    pattern = r'\[(.*?)\]\(buttonurl:(.*?)\)'   # <-- colon ke baad ka URL capture
+    pattern = r'\[(.*?)\]\(buttonurl:(.*?)\)'   # colon ke baad ka sab capture
     buttons = []
     lines = text.split('\n')
     new_text = []
@@ -7931,8 +7931,8 @@ def parse_button(text: str):
         if matches:
             row = []
             for name, url in matches:
-                row.append(InlineKeyboardButton(name, url=url))   # ab url clean hai
-                # Remove the button markup from line
+                # url ab clean hai (bina buttonurl: ke)
+                row.append(InlineKeyboardButton(name, url=url))
                 line = line.replace(f'[{name}](buttonurl:{url})', '').strip()
             buttons.append(row)
         new_text.append(line)
