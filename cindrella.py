@@ -7921,25 +7921,32 @@ import re
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 def parse_button(text: str):
-    """Parse button syntax: [Text](buttonurl:link)"""
-    pattern = r'\[(.*?)\]\(buttonurl:(.*?)\)'   # colon ke baad ka sab capture
-    buttons = []
+    """
+    Simple button parser: [Button Text](https://example.com)
+    Returns (clean_text, button_rows)
+    """
     lines = text.split('\n')
-    new_text = []
-    for line in lines:
-        matches = re.findall(pattern, line)
-        if matches:
-            row = []
-            for name, url in matches:
-                # url ab clean hai (bina buttonurl: ke)
-                row.append(InlineKeyboardButton(name, url=url))
-                line = line.replace(f'[{name}](buttonurl:{url})', '').strip()
-            buttons.append(row)
-        new_text.append(line)
-    clean_text = '\n'.join(new_text).strip()
-    return clean_text, buttons
+    button_rows = []
+    clean_lines = []
     
-
+    for line in lines:
+        # Pattern: [Any text](URL)
+        match = re.match(r'^\s*\[([^\]]+)\]\(([^)]+)\)\s*$', line)
+        if match:
+            button_text = match.group(1)
+            url = match.group(2)
+            # Validate URL (must start with http://, https://, or tg://)
+            if url.startswith(('http://', 'https://', 'tg://')):
+                button_rows.append([InlineKeyboardButton(button_text, url=url)])
+            else:
+                # Invalid URL – treat as normal text
+                clean_lines.append(line)
+        else:
+            clean_lines.append(line)
+    
+    clean_text = '\n'.join(clean_lines).strip()
+    return clean_text, button_rows
+    
 async def permapin_command(client: Client, message: Message, verified=False, admin_id: int = None) -> None:
     # Only groups allowed
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
