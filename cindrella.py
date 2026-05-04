@@ -5432,6 +5432,9 @@ async def track_toggle(client: Client, message: Message):
 
 async def message_tracker(client: Client, message: Message):
 
+    if message.text and message.text.startswith('/'):
+        return
+    
     if not message.from_user:
         return
 
