@@ -1451,7 +1451,6 @@ async def get_user_from_identifier(client, chat_id, identifier):
 # ----- Update get_target_user -----
 async def get_target_user(client: Client, message: Message):
     """Extract user from reply, user ID, username, or full name mention."""
-    # If reply, get that user
     if message.reply_to_message:
         return message.reply_to_message.from_user
 
@@ -1459,24 +1458,40 @@ async def get_target_user(client: Client, message: Message):
     if not args:
         return None
 
-    # Join all arguments to support multi‑word names
     user_input = " ".join(args).strip()
 
-    # Private chat: just try to get the user globally
+    # Private chat: try get_users
     if message.chat.type in (enums.ChatType.PRIVATE, enums.ChatType.BOT):
         try:
             return await client.get_users(user_input)
         except Exception:
             return None
 
-    # Try to parse as user ID (must be numeric only)
+    # --- Numeric ID handling with fallback ---
     if user_input.isdigit():
+        user_id = int(user_input)
+        # 1. Try get_users (works if bot knows the user)
         try:
-            return await client.get_users(int(user_input))
-        except:
-            pass
+            return await client.get_users(user_id)
+        except Exception:
+            # 2. Fallback: get_chat (works for any valid user ID)
+            try:
+                chat = await client.get_chat(user_id)
+                if chat.type == enums.ChatType.PRIVATE:
+                    return chat  # Chat object with user details
+                else:
+                    return None
+            except Exception:
+                # 3. Last resort: if in group, try get_chat_member
+                if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+                    try:
+                        member = await client.get_chat_member(message.chat.id, user_id)
+                        return member.user
+                    except:
+                        pass
+                return None
 
-    # Try as username (strip leading @)
+    # Try as username
     if user_input.startswith('@'):
         user_input = user_input[1:]
     try:
@@ -1484,12 +1499,10 @@ async def get_target_user(client: Client, message: Message):
     except:
         pass
 
-    # --- Full name matching in groups ---
-    chat_id = message.chat.id
+    # Full name matching (existing code)
     full_name = user_input.lower().strip()
-    # Search among recently active members (from active_users cache)
-    recent_uids = list(active_users.get(chat_id, deque()))
-    for uid in recent_uids:
+    chat_id = message.chat.id
+    for uid in list(active_users.get(chat_id, deque())):
         try:
             user = await client.get_users(uid)
             name = f"{user.first_name} {user.last_name or ''}".strip().lower()
@@ -1498,7 +1511,7 @@ async def get_target_user(client: Client, message: Message):
         except:
             continue
 
-    # If still not found, try to fetch all members (slow, only as last resort)
+    # Full member scan (slow)
     try:
         async for member in client.get_chat_members(chat_id):
             user = member.user
@@ -1511,6 +1524,7 @@ async def get_target_user(client: Client, message: Message):
         pass
 
     return None
+    
 
 def parse_duration(raw: str) -> int:
     """Convert duration string like 1m, 2h, 3d, 1w, 2M, 1y to seconds."""
@@ -6862,54 +6876,79 @@ async def info(client: Client, message: Message) -> None:
         else:
             user = message.from_user
 
-    if user:
-        try:
-            member = await client.get_chat_member(message.chat.id, user.id)
-            st = member.status
-            if st == enums.ChatMemberStatus.OWNER:
-                status = "Owner 👑"
-            elif st == enums.ChatMemberStatus.ADMINISTRATOR:
-                status = "Admin 👮‍♂️"
-            elif st == enums.ChatMemberStatus.RESTRICTED:
-                if not member.permissions.can_send_messages:
-                    status = "Muted 🔇"
-                else:
-                    status = "Restricted ⚠️"
-            elif st == enums.ChatMemberStatus.BANNED:
-                status = "Banned 🚫"
-            else:
-                status = "Member"
-        except Exception:
-            status = "Not a member"
+    if not user:
+        return await message.reply_text("User not found.")
 
+    # --- Handle both User and Chat objects ---
+    # `get_target_user` now may return a Chat object (if it used get_chat)
+    if hasattr(user, 'type') and user.type == enums.ChatType.PRIVATE:
+        # It's a Chat object (from get_chat)
+        first_name = user.first_name or "Unknown"
+        last_name = user.last_name or ""
+        username = user.username
+        user_id = user.id
+        # Bio isn't available on Chat object, fetch separately
         try:
-            chat = await client.get_chat(user.id)
-            bio = chat.bio if chat.bio else "No bio"
-        except Exception:
+            full_chat = await client.get_chat(user_id)
+            bio = full_chat.bio if full_chat.bio else "No bio"
+        except:
+            bio = "No bio"
+    else:
+        # It's a User object
+        first_name = user.first_name or "Unknown"
+        last_name = user.last_name or ""
+        username = user.username
+        user_id = user.id
+        try:
+            full_chat = await client.get_chat(user_id)
+            bio = full_chat.bio if full_chat.bio else "No bio"
+        except:
             bio = "No bio"
 
-        user_link = f"<a href='https://t.me/{user.username}'>Link</a>" if user.username else f"<a href='tg://user?id={user.id}'>Link</a>"
+    # --- Status (only if the user is a member of this chat) ---
+    try:
+        member = await client.get_chat_member(message.chat.id, user_id)
+        st = member.status
+        if st == enums.ChatMemberStatus.OWNER:
+            status = "Owner 👑"
+        elif st == enums.ChatMemberStatus.ADMINISTRATOR:
+            status = "Admin 👮‍♂️"
+        elif st == enums.ChatMemberStatus.RESTRICTED:
+            if not member.permissions.can_send_messages:
+                status = "Muted 🔇"
+            else:
+                status = "Restricted ⚠️"
+        elif st == enums.ChatMemberStatus.BANNED:
+            status = "Banned 🚫"
+        else:
+            status = "Member"
+    except Exception:
+        status = "Not a member"
 
-        if message.chat.type == enums.ChatType.PRIVATE:
-            text = f"""
+    # --- User link ---
+    user_link = f"<a href='https://t.me/{username}'>Link</a>" if username else f"<a href='tg://user?id={user_id}'>Link</a>"
+
+    # --- Build text ---
+    if message.chat.type == enums.ChatType.PRIVATE:
+        text = f"""
 <b>User Information</b>
 
-<b>Name:</b> {user.first_name} {user.last_name or ""}
-<b>Username:</b> @{user.username if user.username else "None"}
-<b>User ID:</b> <code>{user.id}</code>
+<b>Name:</b> {first_name} {last_name}
+<b>Username:</b> @{username if username else "None"}
+<b>User ID:</b> <code>{user_id}</code>
 
 <b>User:</b> {user_link}
 
 <b>Bio:</b>
 {bio} 
 """
-        else:
-            text = f"""
+    else:
+        text = f"""
 <b>User Information</b>
 
-<b>Name:</b> {user.first_name} {user.last_name or ""}
-<b>Username:</b> @{user.username if user.username else "None"}
-<b>User ID:</b> <code>{user.id}</code>
+<b>Name:</b> {first_name} {last_name}
+<b>Username:</b> @{username if username else "None"}
+<b>User ID:</b> <code>{user_id}</code>
 <b>Status:</b> {status}
 
 <b>User:</b> {user_link}
@@ -6918,14 +6957,16 @@ async def info(client: Client, message: Message) -> None:
 {bio}
 """
 
-        photo = None
-        async for p in client.get_chat_photos(user.id, limit=1):
-            photo = p.file_id
+    # --- Photo ---
+    photo = None
+    async for p in client.get_chat_photos(user_id, limit=1):
+        photo = p.file_id
 
-        if photo:
-            await message.reply_photo(photo, caption=text, parse_mode=enums.ParseMode.HTML)
-        else:
-            await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+    if photo:
+        await message.reply_photo(photo, caption=text, parse_mode=enums.ParseMode.HTML)
+    else:
+        await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+        
             
 async def report(client: Client, message: Message) -> None:
     # Only groups allowed
