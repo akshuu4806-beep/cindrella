@@ -678,6 +678,93 @@ def get_filter_data(message: Message):
         return {"type": "voice", "file_id": message.voice.file_id}
     return None
 
+# ---- Premium (custom_emoji) entity helpers for welcome message ----
+def serialize_entities(entities):
+    """Only keep custom_emoji entities, store as plain dicts for MongoDB."""
+    result = []
+    if not entities:
+        return result
+    for e in entities:
+        try:
+            etype = e.type.value if hasattr(e.type, 'value') else str(e.type).split('.')[-1].lower()
+        except Exception:
+            continue
+        if etype != 'custom_emoji':
+            continue
+        ent = {'type': 'custom_emoji', 'offset': int(e.offset), 'length': int(e.length)}
+        cid = getattr(e, 'custom_emoji_id', None)
+        if cid:
+            ent['custom_emoji_id'] = str(cid)
+        result.append(ent)
+    return result
+
+
+def build_entities_from_data(ent_list):
+    """Rebuild MessageEntity objects from stored dicts."""
+    from pyrogram.types import MessageEntity
+    from pyrogram.enums import MessageEntityType
+    result = []
+    if not ent_list:
+        return result
+    for d in ent_list:
+        try:
+            try:
+                etype = MessageEntityType(d.get('type', 'custom_emoji'))
+            except Exception:
+                continue
+            kwargs = {'type': etype, 'offset': int(d['offset']), 'length': int(d['length'])}
+            if d.get('custom_emoji_id'):
+                kwargs['custom_emoji_id'] = d['custom_emoji_id']
+            result.append(MessageEntity(**kwargs))
+        except Exception as ex:
+            print(f"build_entities_from_data error: {ex}")
+            continue
+    return result
+
+
+def format_welcome_text_with_entities(template, entities_list, user, chat_name="", chat_owner=""):
+    """Same as format_welcome_text, but also shifts stored entity offsets after placeholder replacement."""
+    if template is None:
+        template = ""
+    replacements = {
+        "{username}": f"@{user.username}" if user.username else "No username",
+        "{fullname}": f"{user.first_name} {user.last_name or ''}".strip(),
+        "{firstname}": user.first_name,
+        "{lastname}": user.last_name or "",
+        "{id}": str(user.id),
+        "{mention}": f"<a href='tg://user?id={user.id}'>{user.first_name}</a>",
+        "{date}": datetime.now().strftime("%Y-%m-%d"),
+        "{time}": datetime.now().strftime("%H:%M:%S"),
+        "{datetime}": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "{chatname}": chat_name,
+        "{chatowner}": chat_owner,
+    }
+    pattern = re.compile('|'.join(re.escape(k) for k in replacements.keys()))
+    matches = [(m.start(), m.end(), replacements[m.group()]) for m in pattern.finditer(template)]
+
+    new_text = template
+    for start, end, repl in reversed(matches):
+        new_text = new_text[:start] + repl + new_text[end:]
+
+    adjusted = []
+    for ent in (entities_list or []):
+        offset = int(ent['offset'])
+        length = int(ent['length'])
+        shift = 0
+        skip = False
+        for start, end, repl in matches:
+            if end <= offset:
+                shift += len(repl) - (end - start)
+            elif start < offset + length:
+                skip = True
+                break
+        if skip:
+            continue
+        new_ent = dict(ent)
+        new_ent['offset'] = offset + shift
+        adjusted.append(new_ent)
+    return new_text, adjusted
+
 # --- MongoDB e functions ---
 def extract_plain_name(mention: str, user_id: int) -> str:
     """Extract plain name from HTML mention like '<a href="tg://user?id=123">John</a>'."""
@@ -2366,6 +2453,10 @@ async def setwelcome(client: Client, message: Message, verified=False) -> None:
                 'file_id': None,
                 'caption': None
             }
+            # 🔥 Preserve premium (custom_emoji) entities
+            saved_entities = serialize_entities(reply.entities)
+            if saved_entities:
+                data['entities'] = saved_entities
             if button_rows:
                 data['buttons'] = button_rows
 
@@ -2750,10 +2841,20 @@ async def send_welcome_goodbye(client, chat_id, user, data, reply_to_message_id=
         chat_name = "Group"
         chat_owner = "Unknown"
 
-    caption = data.get('caption') or data.get('text') or ''
-    caption = format_welcome_text(caption, user, chat_name, chat_owner)
+    caption_raw = data.get('caption') or data.get('text') or ''
     msg_type = data.get('type', 'text')
     file_id = data.get('file_id')
+
+    saved_entities = data.get('entities')
+    adjusted_entities = []
+    if msg_type == 'text' and saved_entities:
+        caption, adjusted_entities = format_welcome_text_with_entities(
+            caption_raw, saved_entities, user, chat_name, chat_owner
+        )
+    else:
+        caption = format_welcome_text(caption_raw, user, chat_name, chat_owner)
+
+    premium_entities = build_entities_from_data(adjusted_entities) if adjusted_entities else []
 
     # Create reply_markup if buttons exist
     reply_markup = None
@@ -2820,12 +2921,22 @@ async def send_welcome_goodbye(client, chat_id, user, data, reply_to_message_id=
             )
         else:
             # Plain text message
-            await client.send_message(
-                chat_id, caption,
-                parse_mode=enums.ParseMode.HTML,
-                reply_to_message_id=reply_to_message_id,
-                reply_markup=reply_markup
-            )
+            if premium_entities:
+                # 🔥 Premium emoji — send with entities (no parse_mode)
+                await client.send_message(
+                    chat_id, caption,
+                    entities=premium_entities,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=reply_markup
+                )
+            else:
+                await client.send_message(
+                    chat_id, caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=reply_markup
+                )
+                
     except Exception as e:
         print(f"Error sending: {e}")
         # Fallback: send only text (without buttons) if anything fails
