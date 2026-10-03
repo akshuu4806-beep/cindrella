@@ -643,7 +643,7 @@ def help_keyboard() -> InlineKeyboardMarkup:
 
 def start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Add To Group", url=f"https://t.me/{bot_username}?startgroup=true"), InlineKeyboardButton("Get Your Own Bot", callback_data="start:ownbot")],
+        [InlineKeyboardButton("Add To Group", url=f"https://t.me/{bot_username}?startgroup=true"), 
         [InlineKeyboardButton("Update", url="https://t.me/+rjE5xZlIK4U3ODA1")],
     ])
 
@@ -1682,27 +1682,6 @@ async def start_buttons(client: Client, callback_query: CallbackQuery) -> None:
             "Check /privacy to view the privacy policy, and interact with your data.\n",
             reply_markup=start_keyboard(bot_username)
         )
-    elif action == "ownbot":
-        await q.edit_message_text(
-            f"Get your own clone of {bot_name} with your own bot token!:\n\n"
-            "How to clone:\n"
-            "1) Create a new bot by BotFather\n"
-            "2) Copy the bot token\n"
-            "3) Use: /clone YOUR_TOKEN\n\n"
-            "Your bot will have all the same features!\n",
-            reply_markup=start_back_keyboard(bot_username)
-        )
-
-async def clone(client: Client, message: Message) -> None:
-    await message.reply_text(
-        "Clone guide:\n"
-        "git clone <repo-url>\n"
-        "cd <repo>\n"
-        "python -m venv .venv && source .venv/bin/activate\n"
-        "pip install -r requirements.txt\n"
-        "cp .env.example .env (set BOT_TOKEN)\n"
-        "python bot.py"
-    )
 
 async def help_cmd(client: Client, message: Message) -> None:
     me = await client.get_me()
