@@ -643,7 +643,7 @@ def help_keyboard() -> InlineKeyboardMarkup:
 
 def start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Add To Group", url=f"https://t.me/{bot_username}?startgroup=true"), 
+        [InlineKeyboardButton("Add To Group", url=f"https://t.me/{bot_username}?startgroup=true")], 
         [InlineKeyboardButton("Update", url="https://t.me/itz_darkX")],
     ])
 
