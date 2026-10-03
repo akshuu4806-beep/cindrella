@@ -13385,7 +13385,7 @@ def main():
 
     # Command handlers
     commands = {
-        "start": start, "clone": clone, "help": help_cmd, "reload": reload_bot, "language": language,
+        "start": start, "help": help_cmd, "reload": reload_bot, "language": language,
         "owner": owner_group, "antiraid": antiraid_cmd, "connection": connection, "disable": disable_cmd,
         "enable": enable_cmd, "disabled": disabled_cmds, "setglog": set_global_log,
         "logchannel": log_channel, "mics": mics, "setwelcome": setwelcome, "resetwelcome": resetwelcome,
